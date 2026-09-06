@@ -1302,8 +1302,7 @@ mod tests {
         assert_eq!(
             payload_bindings.len(),
             2,
-            "same-named captures in different cases need distinct bindings: {:?}",
-            payload_bindings
+            "same-named captures in different cases need distinct bindings: {payload_bindings:?}"
         );
         let fallback_binding = facts
             .bindings

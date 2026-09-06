@@ -14,6 +14,29 @@
     (function_declarator (identifier) @definition.function)))
 
 (translation_unit
+  (function_definition
+    type: (_)
+    declarator: (function_declarator
+      declarator: (qualified_identifier) @definition.function)
+    body: (_)))
+
+(translation_unit
+  (function_definition
+    type: (_)
+    declarator: (pointer_declarator
+      declarator: (function_declarator
+        declarator: (qualified_identifier) @definition.function))
+    body: (_)))
+
+(translation_unit
+  (function_definition
+    type: (_)
+    declarator: (reference_declarator
+      (function_declarator
+        declarator: (qualified_identifier) @definition.function))
+    body: (_)))
+
+(translation_unit
   (class_specifier (type_identifier) @definition.class))
 
 (translation_unit

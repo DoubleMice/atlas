@@ -395,6 +395,7 @@ search `lang:` prefix → `CapabilityProfile::all_compiled()` → golden fixture
 | FileLock 互斥 | `reject_if_held_by_foreign_live_pid` 等 | 其他 live PID → `cli_index_lock_held`；同 PID 豁免 |
 | 短名 / 限定名解析 | `resolve_by_name_short_name_*`（atlas-engine） | 短名 `GetDev` 命中 `CertUtils::GetDev`；多短名 → Ambiguous + 全 qname `symbol_ref`；精确 qname 仍 UniqueQname |
 | C++ 限定调用抽取 | `test_cpp_qualified_call_ref_simple_name_and_full_text`（extraction） | ref.name=`GetDev`、text=`CertUtils::GetDev`、receiver=`CertUtils`；嵌套 `A::B::method` 全文/前缀正确 |
+| C++ 限定函数定义 | `cpp_qualified_definitions`（extraction integration） | 类外普通函数、嵌套限定名、指针/引用返回、全局限定和精确函数体范围；Manifest 保持文件作用域，返回类型、参数类型和无函数体声明不误捕获。普通限定定义使用 Function，不推断限定名是否表示类，不扩展重载或模板语义。 |
 | C++ 限定调用边 | `test_cpp_qualified_call_creates_calls_edge`（resolution） | call resolved + callers(`CertUtils::GetDev`) 含 `use_dev` |
 | PHP 限定调用抽取 | `test_php_qualified_call_ref_simple_name_and_full_text`（extraction） | ref.name=`bar`；text/receiver 含 `Foo` |
 

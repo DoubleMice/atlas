@@ -11,6 +11,29 @@
 (function_definition
   (function_declarator (identifier) @definition.function))
 
+;; Qualified definitions, e.g. int Stub::dispatch() { ... }.
+;; Capture the declarator, never a qualified return type or parameter type.
+;; A written qualifier alone does not establish whether the owner is a class.
+(function_definition
+  type: (_)
+  declarator: (function_declarator
+    declarator: (qualified_identifier) @definition.function)
+  body: (_))
+
+(function_definition
+  type: (_)
+  declarator: (pointer_declarator
+    declarator: (function_declarator
+      declarator: (qualified_identifier) @definition.function))
+  body: (_))
+
+(function_definition
+  type: (_)
+  declarator: (reference_declarator
+    (function_declarator
+      declarator: (qualified_identifier) @definition.function))
+  body: (_))
+
 ;; Method definitions inside class (field_identifier in function_declarator)
 (function_definition
   (function_declarator (field_identifier) @definition.method))

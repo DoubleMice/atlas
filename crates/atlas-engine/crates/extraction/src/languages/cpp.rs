@@ -36,10 +36,18 @@ fn normalize_cpp_definition(
     file_id: FileId,
 ) -> Option<SymbolDef> {
     let kind = cpp_definition_kind(capture_name)?;
-    let name = node_text(node, source)?;
-    let range = node_range(node);
+    let (written_name, name_node) = if node.kind() == "qualified_identifier" {
+        plain_qualified_definition(node, source)?
+    } else {
+        (node_text(node, source)?, node)
+    };
+    let name = node_text(name_node, source)?;
+    let range = node_range(name_node);
 
-    let qualified_name = qualified_name_from_node_cpp(&name, node, source);
+    let qualified_name = match written_name.strip_prefix("::") {
+        Some(absolute) => absolute.to_string(),
+        None => qualified_name_from_node_cpp(&written_name, node, source),
+    };
     let signature = cpp_extract_signature(capture_name, node, source);
 
     Some(
@@ -47,6 +55,26 @@ fn normalize_cpp_definition(
             .signature(signature)
             .build(),
     )
+}
+
+/// Preserve plain nested qualifiers while keeping the simple name's exact range.
+/// Templates, dependent names and operators need separate identity handling.
+fn plain_qualified_definition<'tree>(
+    node: tree_sitter::Node<'tree>,
+    source: &str,
+) -> Option<(String, tree_sitter::Node<'tree>)> {
+    let prefix = match node.child_by_field_name("scope") {
+        Some(scope) if scope.kind() == "namespace_identifier" => node_text(scope, source)?,
+        Some(_) => return None,
+        None => String::new(), // Leading global :: qualification.
+    };
+    let name = node.child_by_field_name("name")?;
+    let (suffix, name_node) = match name.kind() {
+        "qualified_identifier" => plain_qualified_definition(name, source)?,
+        "identifier" | "field_identifier" => (node_text(name, source)?, name),
+        _ => return None,
+    };
+    Some((format!("{prefix}::{suffix}"), name_node))
 }
 
 fn normalize_cpp_reference(
