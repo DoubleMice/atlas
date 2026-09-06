@@ -10,10 +10,11 @@ use crate::frontend::{
     SymbolExtractorSpec,
 };
 use crate::languages::shared::{
-    SymbolDefBuilder, compact_signature, find_c_like_declaration_header, leading_parenthesized,
-    make_binding_def, make_df_assign_field_target, make_df_assign_target, make_df_assign_value,
-    make_df_call_arg, make_df_parameter, make_df_receiver_or_literal, make_df_return_value,
-    make_reference_use, make_scope_def,
+    SymbolDefBuilder, callable_declaration_identity, compact_signature,
+    find_c_like_declaration_header, leading_parenthesized, make_binding_def,
+    make_df_assign_field_target, make_df_assign_target, make_df_assign_value, make_df_call_arg,
+    make_df_parameter, make_df_receiver_or_literal, make_df_return_value, make_reference_use,
+    make_scope_def,
 };
 use types::capability::FeatureSupport;
 use types::*;
@@ -53,6 +54,13 @@ fn normalize_cpp_definition(
     Some(
         SymbolDefBuilder::new(file_id, Language::Cpp, kind, name, qualified_name, range)
             .signature(signature)
+            .discriminator(
+                if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
+                    callable_declaration_identity(node, source)
+                } else {
+                    None
+                },
+            )
             .build(),
     )
 }

@@ -237,6 +237,7 @@ pub struct SymbolDefBuilder {
     qualified_name: String,
     range: TextRange,
     signature: Option<String>,
+    discriminator: Option<String>,
     exported: bool,
 }
 
@@ -258,6 +259,7 @@ impl SymbolDefBuilder {
             qualified_name,
             range,
             signature: None,
+            discriminator: None,
             exported: false,
         }
     }
@@ -265,6 +267,12 @@ impl SymbolDefBuilder {
     /// Set the function/method signature string.
     pub fn signature(mut self, sig: Option<String>) -> Self {
         self.signature = sig;
+        self
+    }
+
+    /// Preserve distinct callable declaration syntax without claiming type resolution.
+    pub fn discriminator(mut self, value: Option<String>) -> Self {
+        self.discriminator = value;
         self
     }
 
@@ -277,14 +285,14 @@ impl SymbolDefBuilder {
     /// Build the `SymbolDef`.
     ///
     /// Generates a deterministic `SymbolId` from (file_id, language,
-    /// qualified_name, kind) via blake3.
+    /// qualified_name, kind, optional declaration discriminator) via blake3.
     pub fn build(self) -> SymbolDef {
         let symbol_id = SymbolId::generate(
             &self.file_id,
             self.language.as_str(),
             &self.qualified_name,
             self.kind.as_str(),
-            None::<&str>,
+            self.discriminator.as_deref(),
         );
 
         SymbolDef {
@@ -309,6 +317,77 @@ impl SymbolDefBuilder {
             layer: "structural".to_string(),
         }
     }
+}
+
+/// C++ declarators and JVM declaration headers distinguish overloads, including
+/// C++ cv/ref qualifiers and Kotlin receivers/default arguments. This is lexical
+/// identity: parameter spelling and modifiers remain significant. Bodies, comments
+/// and whitespace are excluded; no compiler signature equivalence is inferred.
+pub fn callable_declaration_identity(mut node: tree_sitter::Node, source: &str) -> Option<String> {
+    while !matches!(
+        node.kind(),
+        "function_declarator"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "function_declaration"
+    ) {
+        node = node.parent()?;
+    }
+    let mut cursor = node.walk();
+    let end = node
+        .child_by_field_name("body")
+        .or_else(|| {
+            node.named_children(&mut cursor)
+                .find(|n| n.kind() == "function_body")
+        })
+        .map_or(node.end_byte(), |body| body.start_byte());
+    let mut identity = String::new();
+    visit_header_tokens(node, source, end, &mut |token| {
+        use std::fmt::Write;
+        let _ = write!(identity, "{}:{token}", token.len());
+    });
+    Some(identity)
+}
+
+fn visit_header_tokens(
+    node: tree_sitter::Node,
+    source: &str,
+    end: usize,
+    visit: &mut impl FnMut(&str),
+) {
+    if node.start_byte() >= end || node.kind().contains("comment") {
+        return;
+    }
+    if node.child_count() == 0 {
+        if let Ok(token) = node.utf8_text(source.as_bytes()) {
+            visit(token);
+        }
+    } else {
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            visit_header_tokens(child, source, end, visit);
+        }
+    }
+}
+
+/// Read the explicit source package, independent of directory/build conventions.
+pub fn jvm_package_name(mut node: tree_sitter::Node, source: &str) -> Option<String> {
+    while let Some(parent) = node.parent() {
+        node = parent;
+    }
+    let mut cursor = node.walk();
+    let package = node
+        .named_children(&mut cursor)
+        .find(|n| matches!(n.kind(), "package_declaration" | "package_header"))?;
+    let mut cursor = package.walk();
+    let name = package
+        .named_children(&mut cursor)
+        .find(|n| matches!(n.kind(), "identifier" | "scoped_identifier"))?;
+    let mut value = String::new();
+    visit_header_tokens(name, source, name.end_byte(), &mut |token| {
+        value.push_str(token)
+    });
+    Some(value)
 }
 
 /// Normalize a language-level signature for compact UI/API display.
