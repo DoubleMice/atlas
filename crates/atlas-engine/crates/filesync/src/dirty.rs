@@ -59,16 +59,19 @@ fn build_dirty_set_with_required_capability(
     required: FactCoverage,
     on_progress: Option<&(dyn Fn(u64) + Sync)>,
 ) -> Result<DirtySet> {
-    let current_hashes: HashMap<String, String> = discovered
-        .par_iter()
-        .filter_map(|rel_path| {
-            let abs_path = root.join(rel_path);
-            let content = std::fs::read(&abs_path).ok()?;
-            let hash = workspace::file_content_hash(&content);
-            let key = SourcePath::try_from_relative(&rel_path.to_string_lossy()).ok()?;
-            Some((key.as_str().to_string(), hash))
-        })
-        .collect();
+    // Hashing precedes extraction and must not initialize a second Rayon pool.
+    let current_hashes: HashMap<String, String> = extraction::extraction_pool().install(|| {
+        discovered
+            .par_iter()
+            .filter_map(|rel_path| {
+                let abs_path = root.join(rel_path);
+                let content = std::fs::read(&abs_path).ok()?;
+                let hash = workspace::file_content_hash(&content);
+                let key = SourcePath::try_from_relative(&rel_path.to_string_lossy()).ok()?;
+                Some((key.as_str().to_string(), hash))
+            })
+            .collect()
+    });
 
     let db_files = store.list_files().unwrap_or_default();
     let db_hashes: HashMap<String, String> = db_files
