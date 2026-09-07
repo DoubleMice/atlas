@@ -927,8 +927,20 @@ pub fn phase_resolve_and_build(
     root: &Path,
     progress: Option<&Arc<Mutex<ProgressState>>>,
 ) -> Result<GraphResult> {
-    let _span = info_span!(target: "atlas_sync", "sync.phase_resolve_and_build").entered();
+    let span = info_span!(target: "atlas_sync", "sync.phase_resolve_and_build");
+    // Reuse extraction workers instead of retaining a second, default Rayon pool.
+    // Enter the captured span on the worker so phase telemetry keeps its parent.
+    extraction::extraction_pool().install(|| {
+        let _span = span.enter();
+        resolve_and_build(store, root, progress)
+    })
+}
 
+fn resolve_and_build(
+    store: &Arc<Store>,
+    root: &Path,
+    progress: Option<&Arc<Mutex<ProgressState>>>,
+) -> Result<GraphResult> {
     // ── Alias check + optional invalidation ──
     let t_alias = Instant::now();
     let path_alias = PathAliasConfig::resolver(root);
