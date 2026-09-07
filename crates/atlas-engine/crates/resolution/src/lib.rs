@@ -776,8 +776,9 @@ impl ReferenceResolver {
         let t_group = Instant::now();
         let by_file: Vec<(FileId, Vec<ReferenceUse>)> = {
             let mut map: HashMap<FileId, Vec<ReferenceUse>> = HashMap::new();
-            for r in &unresolved {
-                map.entry(r.file_id).or_default().push(r.clone());
+            // Transfer ownership so resolution does not retain a second full inventory.
+            for r in unresolved {
+                map.entry(r.file_id).or_default().push(r);
             }
             map.into_iter().collect()
         };
