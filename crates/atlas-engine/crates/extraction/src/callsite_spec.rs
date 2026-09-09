@@ -267,6 +267,7 @@ fn extract_argument_ranges(call_node: &tree_sitter::Node, _source: &str) -> Vec<
                         if arg_kind == ","
                             || arg_kind == "("
                             || arg_kind == ")"
+                            || arg_kind == "comment"
                             || arg_kind.is_empty()
                         {
                             continue;

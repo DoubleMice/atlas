@@ -55,6 +55,9 @@ struct ScopedResolutionState<'a> {
 
 pub mod builtins;
 pub mod config;
+mod cpp;
+
+pub const KEY_INCLUDE_PATHS: &str = "include_paths";
 
 // Per-strategy hit counters (zero overhead: AtomicU64 inc is lock-free)
 static S1_COUNT: AtomicU64 = AtomicU64::new(0);
@@ -126,6 +129,13 @@ fn resolve_one_core(
 ) -> Option<ResolvedTarget> {
     if is_builtin_reference(reference, ctx.file.language) {
         return None;
+    }
+
+    if ctx.file.language == Language::Cpp && reference.kind == ReferenceKind::Call {
+        let candidates = global_index
+            .map(|index| index.find_by_name(&reference.name))
+            .unwrap_or_else(|| ctx.find_in_file_by_name(&reference.name));
+        return cpp::resolve_call(reference, ctx, &candidates, imported_file_ids);
     }
 
     // Contextual strategies 2-5: shared implementation.
@@ -567,6 +577,9 @@ impl ResolutionSession {
         if is_builtin_reference(reference, file_language) {
             return None;
         }
+        if file_language == Language::Cpp && reference.kind == ReferenceKind::Call {
+            return None; // C++ calls require a file context; no name-only fast path.
+        }
 
         // Strategy 6: Project-wide name search + fuzzy fallback
         if let Some(matched) = self
@@ -798,7 +811,9 @@ impl ReferenceResolver {
             let file_info = store.get_file(&fid).ok().flatten();
             let fp = store.get_resolution_fingerprint(&fid).ok().flatten();
             let is_clean = match (&fp, &file_info) {
-                (Some(fp), Some(info)) => *fp == info.content_hash,
+                (Some(fp), Some(info)) => {
+                    *fp == info.content_hash && info.language != Language::Cpp
+                }
                 _ => false,
             };
             if is_clean {
@@ -1424,6 +1439,32 @@ impl ReferenceResolver {
     ) -> Option<ResolvedTarget> {
         if is_builtin_reference(reference, state.context.file.language) {
             return None;
+        }
+
+        if state.context.file.language == Language::Cpp && reference.kind == ReferenceKind::Call {
+            let candidates = state
+                .candidate_cache
+                .entry(reference.name.clone())
+                .or_insert_with(|| {
+                    self.store
+                        .find_symbols_by_name(&reference.name)
+                        .unwrap_or_default()
+                });
+            let visible_candidates: Vec<_> = candidates
+                .iter()
+                .filter(|symbol| {
+                    state
+                        .visibility_filter
+                        .is_none_or(|filter| filter(symbol, reference.file_id))
+                })
+                .cloned()
+                .collect();
+            return cpp::resolve_call(
+                reference,
+                state.context,
+                &visible_candidates,
+                &state.preferred_files,
+            );
         }
 
         // Contextual strategies 2-5 are shared with resolve_one_core.
@@ -2180,8 +2221,8 @@ int use_dev() {
             .find_symbols_by_qname("CertUtils::GetDev")
             .unwrap()
             .into_iter()
-            .next()
-            .expect("GetDev symbol");
+            .find(|symbol| symbol.kind == SymbolKind::Function)
+            .expect("GetDev definition");
         let callers = graph.callers(&get_dev.id);
         let caller_names: Vec<&str> = callers
             .callers

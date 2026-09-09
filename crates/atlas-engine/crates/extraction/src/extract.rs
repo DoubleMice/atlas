@@ -507,6 +507,36 @@ pub fn extract_file_with_mode(
     let binder = SemanticBinder::new(&symbols, &scopes);
     binder.bind_all(file_id, &mut references, &mut raw_edges);
 
+    // C++ unqualified call names can be hidden by parameters or locals. Reuse
+    // lexical lookup for the references already extracted; Structural mode does
+    // not need a second AST scan to establish this boundary.
+    if language == Language::Cpp {
+        let mut scope_bindings: HashMap<ScopeId, Vec<&BindingDef>> = HashMap::new();
+        for binding in &bindings {
+            scope_bindings
+                .entry(binding.scope_id)
+                .or_default()
+                .push(binding);
+        }
+        let scopes_by_id = scopes.iter().map(|scope| (scope.id, scope)).collect();
+        for reference in &mut references {
+            if reference.kind == ReferenceKind::Call
+                && reference.receiver.is_none()
+                && let Some(scope_id) = reference.scope_id
+            {
+                reference.binding_id = super::languages::shared::resolve_binding_in_scope_chain(
+                    &scope_bindings,
+                    &scopes_by_id,
+                    scope_id,
+                    &reference.name,
+                    reference.range.start_byte,
+                    |scope| frontend.lexical.inherits_bindings_from_parent(scope),
+                )
+                .map(|binding| binding.id);
+            }
+        }
+    }
+
     // 8a. Build identifier-use BindingUse records from the AST.
     //
     // The LexicalBinder (step 7a) only creates BindingUse records at

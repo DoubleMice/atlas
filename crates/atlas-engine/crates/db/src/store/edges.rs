@@ -59,6 +59,17 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Load extracted call references, including resolved calls, for a relation projection.
+    /// The caller must admit the artifact against its resource budget before loading.
+    pub fn get_all_call_references(&self) -> anyhow::Result<Vec<ReferenceUse>> {
+        let conn = self.lock_read();
+        let mut stmt = conn.prepare(&format!(
+            "{REFERENCE_SELECT_NO_WHERE} WHERE kind = ?1 ORDER BY file_id, range_start_byte, reference_id"
+        ))?;
+        let rows = stmt.query_map(params![ReferenceKind::Call.as_str()], row_to_reference)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// Find unresolved references (no resolved target).
     pub fn find_unresolved_references(&self) -> anyhow::Result<Vec<ReferenceUse>> {
         let conn = self.lock_read();
@@ -386,6 +397,10 @@ impl Store {
     /// Returns the number of references invalidated.
     pub fn invalidate_all_references(&self) -> anyhow::Result<usize> {
         let conn = self.lock();
+        conn.execute(
+            "UPDATE extraction_state SET resolution_fingerprint = NULL",
+            [],
+        )?;
         let count = conn.execute(
             r#"UPDATE "references" SET
                 resolved_symbol_id = NULL,

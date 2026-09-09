@@ -75,6 +75,17 @@
     (function_declarator (field_identifier) @definition.method)))
 
 ;; Class declarations
+
+;; Plain free-function declarations establish cross-file visibility. Restrict
+;; these to file/namespace scope; local declarations require separate binding.
+(translation_unit
+  (declaration
+    declarator: (function_declarator declarator: (identifier) @definition.function_declaration)))
+(namespace_definition
+  body: (declaration_list
+    (declaration
+      declarator: (function_declarator declarator: (identifier) @definition.function_declaration))))
+
 (class_specifier (type_identifier) @definition.class)
 
 ;; Struct declarations (treated as class in Atlas)
@@ -100,11 +111,11 @@
   (class_specifier (type_identifier) @definition.class))
 
 ;; ===== Field declarations (data members, excluding methods) =====
-;; Function pointer field: void (*handler)(int);
+;; A method returning a pointer is a callable, not a data field.
 (field_declaration
   (pointer_declarator
     (function_declarator
-      (field_identifier) @definition.field)))
+      (field_identifier) @definition.method)))
 
 ;; Function pointer field with parenthesized pointer declarator:
 ;; int (*handler)(int);
@@ -114,17 +125,15 @@
       (pointer_declarator
         (field_identifier) @definition.field))))
 
-;; Regular data field: int value_;
+;; Direct data declarators, independent of the spelling of their type.
+;; Keep the declarator shape explicit so methods are not captured as fields.
 (field_declaration
-  (type_identifier)
-  (field_identifier) @definition.field)
+  declarator: (field_identifier) @definition.field)
 
-;; Data field with template type: std::vector<int> items_;
 (field_declaration
-  (template_type)
-  (field_identifier) @definition.field)
+  declarator: (pointer_declarator
+    declarator: (field_identifier) @definition.field))
 
-;; Data field with qualified_identifier type: std::string name_;
 (field_declaration
-  (qualified_identifier)
-  (field_identifier) @definition.field)
+  declarator: (reference_declarator
+    (field_identifier) @definition.field))

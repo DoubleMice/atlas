@@ -71,6 +71,17 @@ impl IndexPipeline {
         sink: &dyn ProgressSink,
         interrupted: &mut (dyn FnMut() -> bool + Send),
     ) -> Result<IndexPipelineStats> {
+        for path in &self.options.include_paths {
+            anyhow::ensure!(
+                !path.as_os_str().is_empty()
+                    && !path.is_absolute()
+                    && path.components().all(|component| matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::Normal(_)
+                    )),
+                "include paths must be project-relative without parent traversal"
+            );
+        }
         let mut stats = IndexPipelineStats::default();
         // Initial value: the first phase we'd attempt.  Updated to the last
         // *completed* phase after each success.  Used as `last_phase` in
@@ -143,7 +154,17 @@ impl IndexPipeline {
             });
         };
 
-        let dirty_set = match phase_dirty_check(
+        // A language change invalidates extraction even when source bytes are unchanged.
+        // Only discovered files can be configured; overrides cannot expand index scope.
+        let discovered_paths: std::collections::HashSet<_> = discovered.iter().collect();
+        for path in self.options.file_languages.keys() {
+            anyhow::ensure!(
+                discovered_paths.contains(path),
+                "file language override is outside discovered scope: {}",
+                path.display()
+            );
+        }
+        let mut dirty_set = match phase_dirty_check(
             &self.store,
             &discovered,
             &self.project_root,
@@ -159,6 +180,24 @@ impl IndexPipeline {
                 return Err(e);
             }
         };
+        let mut dirty_paths: std::collections::HashSet<_> =
+            dirty_set.dirty.iter().cloned().collect();
+        for file in self.store.list_files()? {
+            let path = std::path::PathBuf::from(&file.path);
+            if discovered_paths.contains(&path)
+                && self
+                    .options
+                    .file_languages
+                    .get(&path)
+                    .copied()
+                    .or_else(|| types::Language::from_path(&path))
+                    != Some(file.language)
+                && dirty_paths.insert(path.clone())
+            {
+                dirty_set.dirty.push(path);
+                dirty_set.clean_count = dirty_set.clean_count.saturating_sub(1);
+            }
+        }
         sink.emit(ProgressEvent::PhaseFinished {
             phase: PhaseName::HashCheck,
             succeeded: (dirty_set.dirty.len() + dirty_set.clean_count) as u64,
@@ -175,6 +214,11 @@ impl IndexPipeline {
 
         // Save counts for skip-resolution check.
         let dirty_count = dirty_set.dirty.len();
+        if dirty_count > 0 || !dirty_set.deleted.is_empty() {
+            // Cleanup/extraction can finish before cancellation. On retry the
+            // file hashes may already match, but resolution still needs to run.
+            self.store.set_metadata(KEY_RESOLUTION_CONFIG_HASH, "")?;
+        }
 
         // ── Phase 3: Cleanup ────────────────────────────────────────────
         let _p_t0 = Instant::now();
@@ -244,11 +288,26 @@ impl IndexPipeline {
             false
         };
 
+        let include_paths = serde_json::to_string(&self.options.include_paths)?;
+        let includes_changed = self
+            .store
+            .get_metadata(resolution::KEY_INCLUDE_PATHS)?
+            .unwrap_or_else(|| "[]".into())
+            != include_paths;
+        if includes_changed {
+            // A failed rebuild must not be treated as a no-op on retry.
+            self.store.set_metadata(KEY_RESOLUTION_CONFIG_HASH, "")?;
+            self.store.invalidate_all_references()?;
+            self.store.delete_all_edges()?;
+        }
+        self.store
+            .set_metadata(resolution::KEY_INCLUDE_PATHS, &include_paths)?;
+
         // ── Skip-resolution check ────────────────────────────────────────
         // Determines whether resolution (Phase 7), annotation materialise
         // (Phase 8), and summary rebuild (Phase 9) can be skipped because
         // nothing has changed since the last successful run.
-        let skip_resolution = if alias_changed {
+        let skip_resolution = if alias_changed || includes_changed {
             false // Force re-resolution so phase_resolve_and_build can invalidate
         } else if self.options.mode.produces_references() {
             self.should_skip_resolution(dirty_count, deleted_count, stale_count)?
@@ -272,16 +331,17 @@ impl IndexPipeline {
                 phase: PhaseName::LanguageInit,
                 total: 0,
             });
-            let frontend_cache = match phase_init_frontends(&files_to_extract) {
-                Ok(fe) => fe,
-                Err(e) => {
-                    sink.emit(ProgressEvent::Warning {
-                        phase: PhaseName::LanguageInit,
-                        message: format!("{e:#}"),
-                    });
-                    return Err(e);
-                }
-            };
+            let frontend_cache =
+                match phase_init_frontends(&files_to_extract, &self.options.file_languages) {
+                    Ok(fe) => fe,
+                    Err(e) => {
+                        sink.emit(ProgressEvent::Warning {
+                            phase: PhaseName::LanguageInit,
+                            message: format!("{e:#}"),
+                        });
+                        return Err(e);
+                    }
+                };
             let lang_count = frontend_cache.len();
             sink.emit(ProgressEvent::PhaseFinished {
                 phase: PhaseName::LanguageInit,
@@ -600,6 +660,10 @@ impl IndexPipeline {
             });
             return Err(e);
         }
+        self.store.set_metadata(
+            crate::index_pipeline::KEY_FILE_LANGUAGES,
+            &serde_json::to_string(&self.options.file_languages)?,
+        )?;
         if let Err(e) = phase_finalize(
             &self.store,
             &self.project_root,

@@ -97,12 +97,50 @@ fn normalize_cpp_reference(
     let range = node_range(node);
 
     // Walk to the outermost qualified_identifier so nested A::B::C keeps full text.
-    let (text, receiver) = qualified_call_text_and_receiver(node, source, &name);
+    let (text, receiver) = if let Some(field) = node
+        .parent()
+        .filter(|p| p.kind() == "field_expression" && p.child_by_field_name("field") == Some(node))
+    {
+        (
+            node_text(field, source)?,
+            field
+                .child_by_field_name("argument")
+                .and_then(|n| node_text(n, source)),
+        )
+    } else {
+        qualified_call_text_and_receiver(node, source, &name)
+    };
 
     // source_symbol is resolved by SemanticBinder after extraction.
     let mut r = make_reference_use(file_id, kind, text, name, range);
     if let Some(recv) = receiver {
         r.receiver = Some(recv);
+    }
+    if kind == ReferenceKind::Call {
+        let mut callee = node;
+        while let Some(parent) = callee.parent() {
+            if parent.kind() == "call_expression" {
+                if parent.child_by_field_name("function") == Some(callee)
+                    && let Some(args) = parent.child_by_field_name("arguments")
+                    && !args.has_error()
+                {
+                    let mut cursor = args.walk();
+                    let args: Vec<_> = args
+                        .named_children(&mut cursor)
+                        .filter(|n| n.kind() != "comment")
+                        .collect();
+                    // A pack expansion is not a known number of arguments.
+                    if args.iter().all(|n| n.kind() != "parameter_pack_expansion") {
+                        r.arity = u32::try_from(args.len()).ok();
+                    }
+                }
+                break;
+            }
+            if !matches!(parent.kind(), "qualified_identifier" | "field_expression") {
+                break;
+            }
+            callee = parent;
+        }
     }
     Some(r)
 }
@@ -340,7 +378,7 @@ fn qualified_name_from_node_cpp(name: &str, node: tree_sitter::Node, source: &st
 
 fn cpp_definition_kind(capture: &str) -> Option<SymbolKind> {
     match capture {
-        "definition.function" => Some(SymbolKind::Function),
+        "definition.function" | "definition.function_declaration" => Some(SymbolKind::Function),
         "definition.method" => Some(SymbolKind::Method),
         "definition.class" => Some(SymbolKind::Class),
         "definition.namespace" => Some(SymbolKind::Namespace),
@@ -404,8 +442,22 @@ fn cpp_extract_signature(
     node: tree_sitter::Node,
     source: &str,
 ) -> Option<String> {
-    if capture_name != "definition.function" && capture_name != "definition.method" {
+    if !matches!(
+        capture_name,
+        "definition.function" | "definition.function_declaration" | "definition.method"
+    ) {
         return None;
+    }
+    let mut ancestor = node.parent();
+    while let Some(parent) = ancestor {
+        if parent.kind() == "template_declaration" {
+            // Template substitution is outside the plain callable-signature subset.
+            return None;
+        }
+        if matches!(parent.kind(), "namespace_definition" | "translation_unit") {
+            break;
+        }
+        ancestor = parent.parent();
     }
     let name = node_text(node, source)?;
     let declaration = find_c_like_declaration_header(node, source)?;
@@ -417,11 +469,26 @@ fn cpp_signature_from_header(header: &str, name: &str) -> Option<String> {
     let before_name = header[..name_pos].trim();
     let after_name = header[name_pos + name.len()..].trim();
     let params = leading_parenthesized(after_name)?;
+    // Preserve cv/ref qualifiers: `f() const` and `f()` are distinct overloads.
+    // override/final/pure-specifiers are declaration-only, not type identity.
+    let qualifiers = after_name[params.len()..]
+        .split('=')
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .filter(|part| !matches!(*part, "override" | "final"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let callable = if qualifiers.is_empty() {
+        params.to_string()
+    } else {
+        format!("{params} {qualifiers}")
+    };
     let return_type = before_name.trim_end_matches(['*', '&']).trim();
     if return_type.is_empty() {
-        compact_signature(params)
+        compact_signature(&callable)
     } else {
-        compact_signature(&format!("{params}: {return_type}"))
+        compact_signature(&format!("{callable}: {return_type}"))
     }
 }
 

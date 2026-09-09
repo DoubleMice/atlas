@@ -41,6 +41,8 @@ pub mod focus;
 mod index_precision;
 /// Investigation context: MCP-session-scoped analysis focus for Focus job prioritization.
 pub mod investigation;
+
+pub mod call_context;
 mod lazy_budget;
 /// AnswerQuality tier computation for Focus materialize transparency.
 pub mod precision;

@@ -2089,7 +2089,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-cangjie"
 version = "0.1.0"
-source = "git+https://gitcode.com/Cangjie-SIG/tree-sitter-cangjie.git?rev=2fac636da4191550463a456396cb2680121acf6b#2fac636da4191550463a456396cb2680121acf6b"
 dependencies = [
  "cc",
  "tree-sitter-language",
@@ -2128,7 +2127,6 @@ dependencies = [
 [[package]]
 name = "tree-sitter-kotlin"
 version = "0.4.0"
-source = "git+https://github.com/fwcd/tree-sitter-kotlin?rev=f66d2908542e93c0204c6c241f794afe4e9cd5d1#f66d2908542e93c0204c6c241f794afe4e9cd5d1"
 dependencies = [
  "cc",
  "tree-sitter-language",

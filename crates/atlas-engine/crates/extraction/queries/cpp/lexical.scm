@@ -4,10 +4,32 @@
 (parameter_declaration
   declarator: (identifier) @lexical.parameter)
 
+(parameter_declaration
+  declarator: (pointer_declarator declarator: (identifier) @lexical.parameter))
+(parameter_declaration
+  declarator: (reference_declarator (identifier) @lexical.parameter))
+(parameter_declaration
+  declarator: (function_declarator
+    declarator: (parenthesized_declarator
+      (pointer_declarator declarator: (identifier) @lexical.parameter))))
+
 ;; --- Local variable declarations ---
+(declaration
+  declarator: (identifier) @lexical.local)
+(declaration
+  declarator: (pointer_declarator declarator: (identifier) @lexical.local))
+(declaration
+  declarator: (reference_declarator (identifier) @lexical.local))
+
 (declaration
   declarator: (init_declarator
     declarator: (identifier) @lexical.local))
+(declaration
+  declarator: (init_declarator
+    declarator: (pointer_declarator declarator: (identifier) @lexical.local)))
+(declaration
+  declarator: (init_declarator
+    declarator: (reference_declarator (identifier) @lexical.local)))
 
 ;; --- For-loop initializer (for (int i = 0; ...)) ---
 (for_statement

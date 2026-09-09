@@ -1,6 +1,6 @@
 //! File CRUD: insert, query, delete files and their associated data.
 
-use rusqlite::params;
+use rusqlite::{OptionalExtension, params};
 use types::*;
 
 use super::Store;
@@ -242,6 +242,67 @@ impl Store {
         )?;
         let rows = stmt.query_map(rusqlite::params![pattern], row_to_file_info)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+}
+
+impl Store {
+    /// Resolve a literal C/C++ include. Quotes search the importing directory
+    /// first; both forms then use the explicit ordered include path. Header
+    /// prefixes/suffixes and other directories are not substitutes.
+    pub fn resolve_include_file(
+        &self,
+        import: &ImportDef,
+        include_paths: &[String],
+    ) -> anyhow::Result<Option<FileInfo>> {
+        use std::path::{Component, Path, PathBuf};
+        let Some(source) = self.get_file(&import.file_id)? else {
+            return Ok(None);
+        };
+        let module = import
+            .module
+            .strip_prefix('<')
+            .and_then(|s| s.strip_suffix('>'))
+            .unwrap_or(&import.module);
+        if module.is_empty() || Path::new(module).is_absolute() || module.contains('\\') {
+            return Ok(None);
+        }
+        let mut search = Vec::new();
+        if import.is_relative {
+            search.push(
+                Path::new(&source.path)
+                    .parent()
+                    .unwrap_or(Path::new(""))
+                    .to_path_buf(),
+            );
+        }
+        search.extend(include_paths.iter().map(PathBuf::from));
+        for directory in search {
+            let mut candidate = PathBuf::new();
+            let mut valid = true;
+            for component in directory.join(module).components() {
+                match component {
+                    Component::Normal(part) => candidate.push(part),
+                    Component::CurDir => {}
+                    Component::ParentDir if candidate.pop() => {}
+                    _ => {
+                        valid = false;
+                        break;
+                    }
+                }
+            }
+            if !valid {
+                continue;
+            }
+            let path = candidate.to_string_lossy().replace('\\', "/");
+            let result = self.lock_read().query_row(
+                "SELECT file_id, path, language, content_hash, status FROM files WHERE path = ?1",
+                params![path], row_to_file_info,
+            ).optional()?;
+            if result.is_some() {
+                return Ok(result);
+            }
+        }
+        Ok(None)
     }
 }
 

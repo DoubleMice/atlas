@@ -9,7 +9,7 @@
 //!
 //! ```ignore
 //! let discovered  = phase_discover(root, &include, &exclude)?;
-//! let frontends   = phase_init_frontends(&discovered)?;
+//! let frontends   = phase_init_frontends(&discovered, &Default::default())?;
 //! phase_cleanup_stale(&store, &discovered)?;
 //! let extracted   = phase_extract_serial(root, &discovered, &frontends, mode, None);
 //! phase_write_batched(&store, &extracted, 500, 500, |_| {}, || false)?;
@@ -360,25 +360,61 @@ pub fn phase_cleanup_file_ids(store: &Arc<Store>, file_ids: &[FileId]) -> Result
 ///
 /// Loads tree-sitter grammars via [`LanguageRegistry`] and creates one
 /// [`LanguageFrontend`] per detected language.
-pub fn phase_init_frontends(files: &[PathBuf]) -> Result<HashMap<Language, LanguageFrontend>> {
-    let languages: Vec<Language> =
-        files
-            .iter()
-            .filter_map(|p| Language::from_path(p))
-            .fold(Vec::new(), |mut acc, lang| {
-                if !acc.contains(&lang) {
-                    acc.push(lang);
-                }
-                acc
-            });
+pub struct FileFrontends {
+    by_language: HashMap<Language, LanguageFrontend>,
+    file_languages: std::collections::BTreeMap<PathBuf, Language>,
+}
+
+impl FileFrontends {
+    pub fn len(&self) -> usize {
+        self.by_language.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.by_language.is_empty()
+    }
+
+    fn for_file(&self, path: &Path) -> Option<&LanguageFrontend> {
+        let language = self
+            .file_languages
+            .get(path)
+            .copied()
+            .or_else(|| Language::from_path(path))?;
+        self.by_language.get(&language)
+    }
+}
+
+pub fn phase_init_frontends(
+    files: &[PathBuf],
+    file_languages: &std::collections::BTreeMap<PathBuf, Language>,
+) -> Result<FileFrontends> {
+    let languages: Vec<Language> = files
+        .iter()
+        .filter_map(|p| {
+            file_languages
+                .get(p)
+                .copied()
+                .or_else(|| Language::from_path(p))
+        })
+        .fold(Vec::new(), |mut acc, lang| {
+            if !acc.contains(&lang) {
+                acc.push(lang);
+            }
+            acc
+        });
 
     let _registry =
         LanguageRegistry::new(&languages).context("Failed to initialize language registry")?;
 
-    Ok(languages
-        .iter()
-        .filter_map(|&lang| create_frontend(lang).map(|fe| (lang, fe)))
-        .collect())
+    let mut by_language = HashMap::new();
+    for language in languages {
+        let frontend = create_frontend(language)
+            .with_context(|| format!("Frontend unavailable for {}", language.as_str()))?;
+        by_language.insert(language, frontend);
+    }
+    Ok(FileFrontends {
+        by_language,
+        file_languages: file_languages.clone(),
+    })
 }
 
 // ── Phase 5: Extraction (serial) ───────────────────────────────────────
@@ -390,7 +426,7 @@ pub fn phase_init_frontends(files: &[PathBuf]) -> Result<HashMap<Language, Langu
 pub fn phase_extract_serial(
     root: &Path,
     files: &[PathBuf],
-    frontends: &HashMap<Language, LanguageFrontend>,
+    frontends: &FileFrontends,
     mode: ExtractionMode,
     on_progress: Option<&dyn Fn(usize, usize)>,
 ) -> ExtractedFiles {
@@ -406,11 +442,7 @@ pub fn phase_extract_serial(
 
     for (i, rel_path) in files.iter().enumerate() {
         let abs_path = root.join(rel_path);
-        let lang = match Language::from_path(rel_path) {
-            Some(l) => l,
-            None => continue,
-        };
-        let frontend = match frontends.get(&lang) {
+        let frontend = match frontends.for_file(rel_path) {
             Some(fe) => fe,
             None => continue,
         };
@@ -448,7 +480,7 @@ pub fn phase_extract_serial(
 pub fn phase_extract_parallel(
     root: &Path,
     files: &[PathBuf],
-    frontends: &HashMap<Language, LanguageFrontend>,
+    frontends: &FileFrontends,
     mode: ExtractionMode,
     on_file_progress: Option<&(dyn Fn(usize, usize) + Sync)>,
 ) -> ExtractedFiles {
@@ -476,7 +508,7 @@ pub fn phase_extract_parallel(
 pub fn phase_extract_parallel_cancellable(
     root: &Path,
     files: &[PathBuf],
-    frontends: &HashMap<Language, LanguageFrontend>,
+    frontends: &FileFrontends,
     mode: ExtractionMode,
     on_file_progress: Option<&(dyn Fn(usize, usize) + Sync)>,
     cancel_token: Option<&std::sync::atomic::AtomicBool>,
@@ -515,8 +547,7 @@ pub fn phase_extract_parallel_cancellable(
                 let abs_path = root.join(rel_path);
 
                 let result = (|| -> Option<ExtractedFile> {
-                    let lang = Language::from_path(rel_path)?;
-                    let frontend = frontends.get(&lang)?;
+                    let frontend = frontends.for_file(rel_path)?;
                     match extract_one_index_file(&pool_worker, &abs_path, root, frontend, &mode) {
                         Ok(file) => {
                             symbol_count.fetch_add(file.facts.symbols.len(), Ordering::Relaxed);
@@ -1198,7 +1229,7 @@ mod tests {
         .unwrap();
 
         let files = vec![PathBuf::from("hello.ts")];
-        let frontends = phase_init_frontends(&files).unwrap();
+        let frontends = phase_init_frontends(&files, &Default::default()).unwrap();
         let result = phase_extract_serial(
             dir.path(),
             &files,
@@ -1229,7 +1260,7 @@ mod tests {
         store.init_schema().unwrap();
 
         let files = vec![PathBuf::from("calc.ts")];
-        let frontends = phase_init_frontends(&files).unwrap();
+        let frontends = phase_init_frontends(&files, &Default::default()).unwrap();
         let extracted = phase_extract_serial(
             dir.path(),
             &files,
@@ -1263,7 +1294,7 @@ mod tests {
         store.init_schema().unwrap();
 
         let files = vec![PathBuf::from("a.ts"), PathBuf::from("b.ts")];
-        let frontends = phase_init_frontends(&files).unwrap();
+        let frontends = phase_init_frontends(&files, &Default::default()).unwrap();
         let extracted = phase_extract_serial(
             dir.path(),
             &files,
@@ -1340,7 +1371,7 @@ mod tests {
             paths.push(PathBuf::from(name));
         }
 
-        let frontends = phase_init_frontends(&paths).unwrap();
+        let frontends = phase_init_frontends(&paths, &Default::default()).unwrap();
         let calls: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 
         let result = phase_extract_parallel_cancellable(
@@ -1386,7 +1417,7 @@ mod tests {
             paths.push(PathBuf::from(name));
         }
 
-        let frontends = phase_init_frontends(&paths).unwrap();
+        let frontends = phase_init_frontends(&paths, &Default::default()).unwrap();
 
         // Set the cancel token from the start — every file should be skipped.
         let cancel = std::sync::atomic::AtomicBool::new(true);
@@ -1424,7 +1455,7 @@ mod tests {
             .unwrap();
             paths.push(PathBuf::from(name));
         }
-        let frontends = phase_init_frontends(&paths).unwrap();
+        let frontends = phase_init_frontends(&paths, &Default::default()).unwrap();
         let result = phase_extract_parallel_cancellable(
             dir.path(),
             &paths,
@@ -1444,7 +1475,7 @@ mod tests {
         std::fs::write(dir.path().join("a.ts"), "const a = 1;\n").unwrap();
         std::fs::write(dir.path().join("b.py"), "def b(): pass\n").unwrap();
         let files = vec![PathBuf::from("a.ts"), PathBuf::from("b.py")];
-        let frontends = phase_init_frontends(&files).unwrap();
+        let frontends = phase_init_frontends(&files, &Default::default()).unwrap();
         let result = phase_extract_parallel_cancellable(
             dir.path(),
             &files,
@@ -1478,7 +1509,7 @@ mod tests {
         store.init_schema().unwrap();
 
         let files = vec![PathBuf::from("lib.ts"), PathBuf::from("main.ts")];
-        let frontends = phase_init_frontends(&files).unwrap();
+        let frontends = phase_init_frontends(&files, &Default::default()).unwrap();
         let extracted = phase_extract_serial(
             dir.path(),
             &files,

@@ -235,13 +235,20 @@ impl IncrementalPipeline {
                 total: to_extract_rel.len() as u64,
             });
 
-            let frontends = phase_init_frontends(&to_extract_rel).map_err(|e| {
-                sink.emit(ProgressEvent::Warning {
-                    phase,
-                    message: format!("{e:#}"),
-                });
-                e
-            })?;
+            let file_languages = self
+                .store
+                .get_metadata(crate::index_pipeline::KEY_FILE_LANGUAGES)?
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or_default();
+            let frontends =
+                phase_init_frontends(&to_extract_rel, &file_languages).map_err(|e| {
+                    sink.emit(ProgressEvent::Warning {
+                        phase,
+                        message: format!("{e:#}"),
+                    });
+                    e
+                })?;
 
             sink.emit(ProgressEvent::PhaseFinished {
                 phase,
