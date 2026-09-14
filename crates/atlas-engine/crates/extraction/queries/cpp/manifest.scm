@@ -54,6 +54,9 @@
   (preproc_def (identifier) @definition.macro))
 
 (translation_unit
+  (preproc_function_def name: (identifier) @definition.macro))
+
+(translation_unit
   (template_declaration
     (function_definition (identifier) @definition.function)))
 
