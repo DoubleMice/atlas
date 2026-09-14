@@ -81,11 +81,11 @@ pub struct CompilerBindingGap {
     pub reference_id: Option<ReferenceId>,
     /// A supplied indexed dependency whose identity prevented using the input.
     pub input_path: Option<String>,
-    /// Source location supplied for a virtual call's selected declaration on
+    /// Source location supplied for a call's selected declaration on
     /// matching inputs. Navigation does not require an extracted symbol or a
     /// matching invocation; neither is manufactured from this position.
     pub declaration_location: Option<CompilerLocation>,
-    /// An indexed declaration selected by this virtual-call observation, when
+    /// An indexed declaration selected by this call observation, when
     /// its invocation and declaration locations could be associated precisely.
     /// This is a navigation endpoint, not a runtime implementation. Different
     /// observations may retain different declarations without a unique binding.
@@ -321,7 +321,7 @@ pub fn associate_compiler_calls(
             continue;
         }
         let location_key = observation.location.clone();
-        let declaration_location = if observation.dispatch == CompilerDispatch::Virtual
+        let declaration_location = if observation.dispatch != CompilerDispatch::NotACall
             && association.file(&observation.declaration.location)?.is_ok()
         {
             Some(observation.declaration.location.clone())
@@ -331,10 +331,10 @@ pub fn associate_compiler_calls(
         let (reference_id, result, declaration_id) = match association.reference(observation)? {
             Ok((id, reference)) => {
                 // The selected declaration can be useful even when the runtime
-                // override or compiler caller is unavailable. Do not borrow a
-                // supplied definition as that runtime target, or infer a new
-                // callsite from a matching name.
-                let declaration_id = if observation.dispatch == CompilerDispatch::Virtual {
+                // override, target symbol or compiler caller is unavailable.
+                // Keep the observed declaration separate from any supplied
+                // definition; this does not manufacture a callsite or binding.
+                let declaration_id = if observation.dispatch != CompilerDispatch::NotACall {
                     association.symbol(&observation.declaration)?.ok()
                 } else {
                     None

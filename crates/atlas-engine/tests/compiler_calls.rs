@@ -201,9 +201,21 @@ fn conflicting_virtual_observations_keep_separate_declaration_clues() {
 
 #[test]
 fn virtual_declaration_source_survives_missing_symbols_and_unassociated_calls() {
+    assert_declaration_source(CompilerDispatch::Virtual, "value.run()");
+}
+
+#[test]
+fn direct_declaration_source_survives_missing_symbols_and_unassociated_calls() {
+    assert_declaration_source(CompilerDispatch::Direct, "value.Base::run()");
+}
+
+fn assert_declaration_source(dispatch: CompilerDispatch, written: &str) {
     // The declaration is introduced by a C++ macro. Its source spelling is
     // available even when syntax extraction has no symbol at that position.
-    let source = "#define MEMBER(name) virtual int name() = 0;\nstruct Base { MEMBER(run) };\nint entry(Base& value) { return value.run(); }\n";
+    let formatted = format!(
+        "#define MEMBER(name) virtual int name() = 0;\nstruct Base {{ MEMBER(run) }};\nint entry(Base& value) {{ return {written}; }}\n"
+    );
+    let source = formatted.as_str();
     let facts = extract_file_with_mode(
         &create_frontend(Language::Cpp).unwrap(),
         FileId::generate("sample.cpp"),
@@ -226,15 +238,15 @@ fn virtual_declaration_source_survives_missing_symbols_and_unassociated_calls() 
             .any(|s| s.name_range.start_byte == location.start_byte
                 && s.name_range.end_byte == location.end_byte)
     );
-    let start = source.find("value.run()").unwrap() as u32;
+    let start = source.find(written).unwrap() as u32;
     let observation = CompilerObservation {
         kind: CompilerObservationKind::CallDeclaration,
-        dispatch: CompilerDispatch::Virtual,
-        location: declaration(source, "value.run()", "run").location,
+        dispatch,
+        location: declaration(source, written, "run").location,
         call_expression: Some(CompilerLocation {
             path: "sample.cpp".into(),
             start_byte: start,
-            end_byte: start + 11,
+            end_byte: start + written.len() as u32,
         }),
         declaration: CompilerDeclaration {
             name: "run".into(),
@@ -244,10 +256,13 @@ fn virtual_declaration_source_survives_missing_symbols_and_unassociated_calls() 
         owner: Some(declaration(source, "entry(Base", "entry")),
     };
     let inputs = BTreeMap::from([("sample.cpp".into(), "macro-input".into())]);
-    for call_available in [true, false] {
+    for (call_available, owner_available) in [(true, true), (false, true), (true, false)] {
         let mut observation = observation.clone();
         if !call_available {
             observation.call_expression = None;
+        }
+        if !owner_available {
+            observation.owner = None;
         }
         let report =
             associate_compiler_calls(&store, &[observation], &inputs, &mut || false).unwrap();
@@ -256,10 +271,14 @@ fn virtual_declaration_source_survives_missing_symbols_and_unassociated_calls() 
         let gap = &report.gaps[0];
         assert_eq!(
             gap.reason,
-            if call_available {
-                Gap::DynamicDispatch
-            } else {
+            if !call_available {
                 Gap::CallExpressionUnavailable
+            } else if dispatch == CompilerDispatch::Virtual {
+                Gap::DynamicDispatch
+            } else if !owner_available {
+                Gap::OwnerUnavailable
+            } else {
+                Gap::SymbolNotUnique
             }
         );
         assert_eq!(gap.reference_id.is_some(), call_available);
