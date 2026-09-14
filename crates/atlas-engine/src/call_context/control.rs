@@ -76,6 +76,7 @@ impl Investigation<'_> {
         let mut unexamined_ranges = Vec::new();
         let mut transfers = Vec::new();
         let mut conditional_operands = Vec::new();
+        let mut logical_operands = Vec::new();
         if let Some(function) = syntax {
             // Operand selection is a language fact, independent of whether the
             // statement CFG lowers this expression. Follow only the selected
@@ -89,6 +90,12 @@ impl Investigation<'_> {
                 .take_while(|node| *node != function)
             {
                 self.check()?;
+                if let Some((left, right, role)) = logical_operands_of(node, &parsed.source)
+                    && right.start_byte() <= start as usize
+                    && end as usize <= right.end_byte()
+                {
+                    logical_operands.push((node, left, right, role, selected));
+                }
                 if node.kind() != "conditional_expression" {
                     continue;
                 }
@@ -160,12 +167,54 @@ impl Investigation<'_> {
         if facts.cfg_failed || facts.budget_exceeded {
             return self.control_gap(&subject, "control_analysis_incomplete", "Function CFG extraction failed or exceeded its budget; conditions are not established.", vec![scope]);
         }
+        let mut operand_guards = Vec::new();
+        if !logical_operands.is_empty() {
+            let calls = self.store.find_callsites_by_file(&file_id)?;
+            // Shared across all enclosing expressions, including recursive
+            // operand checks. Exhaustion leaves a located unknown guard.
+            let mut remaining = 256;
+            for (node, left, right, role, selected) in logical_operands {
+                let evaluated = !node.has_error()
+                    && !node.is_missing()
+                    && selected.is_some_and(|selected| {
+                        extraction::cpp_expressions::may_be_evaluated(selected, &parsed.source)
+                    });
+                let supported = evaluated
+                    && self.scalar_operand(left, &parsed, &facts, &calls, &mut remaining)?
+                    && self.scalar_operand(right, &parsed, &facts, &calls, &mut remaining)?;
+                if supported {
+                    operand_guards.push((cpp::range(node), cpp::range(left), role));
+                } else {
+                    let (code, message) = if !evaluated {
+                        (
+                            "control_expression_unestablished",
+                            "Short-circuit operand evaluation is not established for this syntax or evaluation context. Read both operands at the related locations.",
+                        )
+                    } else if remaining == 0 {
+                        (
+                            "control_analysis_budget",
+                            "The shared 256-expression operand type-check budget is exhausted; this short-circuit guard remains unexamined. Independent established guards are retained.",
+                        )
+                    } else {
+                        (
+                            "control_short_circuit_unestablished",
+                            "The recorded operand types do not establish a built-in logical operator. Class/enum operands may use overloaded operators without short-circuit evaluation; unresolved calls and unsupported types require source continuation. Read both operands; independent outer conditions remain applicable.",
+                        )
+                    };
+                    self.control_gap(
+                        &subject,
+                        code,
+                        message,
+                        vec![loc(file_id, left), loc(file_id, right)],
+                    )?;
+                }
+            }
+        }
         let nodes: Vec<_> = facts
             .cfg_nodes
             .into_iter()
             .filter(|n| n.function_id == owner.id)
             .collect();
-        let mut operand_guards = Vec::new();
         for (range, operands, role) in conditional_operands {
             if !nodes
                 .iter()
@@ -365,9 +414,160 @@ impl Investigation<'_> {
                 location: ContextLocation { file_id, range: condition },
                 symbol_id: None,
                 related_locations: vec![scope.clone(), ContextLocation { file_id, range: expression }],
-                message: "Evaluating this selected operand of a C++ conditional expression requires the indicated condition outcome. This source rule does not establish the condition's value, operand execution or a runtime permission decision.".into(),
+                message: "Evaluating this selected operand of a supported C++ conditional or built-in logical expression requires the indicated condition outcome. This source rule does not establish the condition's value, operand execution or a runtime permission decision.".into(),
             });
         }
         self.control_gap(&subject, "control_flow_limited", "Conditions describe this function's recorded CFG and supported source operand guards. Unsupported or omitted flow, callee effects, exceptions, runtime feasibility and caller permissions remain unestablished; no conditions does not mean unrestricted execution.", vec![scope])
     }
+
+    /// A bounded type check, not value evaluation or overload resolution.
+    /// [over.match.oper] permits the built-in rule when neither operand has
+    /// class or enumeration type. Unknown types must not select that rule.
+    fn scalar_operand(
+        &mut self,
+        node: Node<'_>,
+        parsed: &ParsedSource,
+        facts: &FileFacts,
+        calls: &[Callsite],
+        remaining: &mut usize,
+    ) -> anyhow::Result<bool> {
+        self.check()?;
+        if *remaining == 0 || node.has_error() || node.is_missing() {
+            return Ok(false);
+        }
+        *remaining -= 1;
+        match node.kind() {
+            "true" | "false" | "null" => Ok(matches!(
+                cpp::text(node, &parsed.source),
+                "true" | "false" | "nullptr"
+            )),
+            "parenthesized_expression" => match node.named_child(0) {
+                Some(inner) => self.scalar_operand(inner, parsed, facts, calls, remaining),
+                None => Ok(false),
+            },
+            "unary_expression"
+                if node
+                    .child_by_field_name("operator")
+                    .is_some_and(|op| matches!(cpp::text(op, &parsed.source), "!" | "not")) =>
+            {
+                match node.child_by_field_name("argument") {
+                    Some(inner) => self.scalar_operand(inner, parsed, facts, calls, remaining),
+                    None => Ok(false),
+                }
+            }
+            "binary_expression" => {
+                let Some((left, right, _)) = logical_operands_of(node, &parsed.source) else {
+                    return Ok(false);
+                };
+                Ok(self.scalar_operand(left, parsed, facts, calls, remaining)?
+                    && self.scalar_operand(right, parsed, facts, calls, remaining)?)
+            }
+            "identifier" => {
+                let Some(types) = &parsed.cpp else {
+                    return Ok(false);
+                };
+                let name = cpp::text(node, &parsed.source);
+                if types.macros.iter().any(|m| m.name == name)
+                    || types
+                        .lookup_limits
+                        .iter()
+                        .any(|limit| limit.limits_local_lookup(name, node.start_byte() as u32))
+                {
+                    return Ok(false);
+                }
+                let uses: Vec<_> = facts
+                    .binding_uses
+                    .iter()
+                    .filter(|usage| usage.range == cpp::range(node))
+                    .collect();
+                let [usage] = uses.as_slice() else {
+                    return Ok(false);
+                };
+                let Some(id) = usage.binding_id else {
+                    return Ok(false);
+                };
+                let values: Vec<_> = types
+                    .values
+                    .iter()
+                    .filter(|value| value.binding_id == Some(id))
+                    .collect();
+                Ok(
+                    matches!(values.as_slice(), [value] if value.declared_type.as_ref().is_some_and(scalar_type)),
+                )
+            }
+            "call_expression" => {
+                let matches: Vec<_> = calls
+                    .iter()
+                    .filter(|call| call.range == cpp::range(node))
+                    .collect();
+                let [call] = matches.as_slice() else {
+                    return Ok(false);
+                };
+                let resolved = self.store.find_resolved_callsites_by_id(&call.id)?;
+                let [resolved] = resolved.as_slice() else {
+                    return Ok(false);
+                };
+                let Some(callee) = self.store.find_symbol_by_id(&resolved.callee)? else {
+                    return Ok(false);
+                };
+                let Ok(source) = self.source(callee.file_id) else {
+                    return Ok(false);
+                };
+                Ok(source
+                    .cpp
+                    .as_ref()
+                    .and_then(|types| {
+                        types
+                            .callables
+                            .iter()
+                            .find(|decl| decl.symbol_id == callee.id)
+                    })
+                    .and_then(|decl| decl.return_type.as_ref())
+                    .is_some_and(scalar_type))
+            }
+            _ => Ok(false),
+        }
+    }
+}
+
+fn logical_operands_of<'a>(
+    node: Node<'a>,
+    source: &str,
+) -> Option<(Node<'a>, Node<'a>, &'static str)> {
+    if node.kind() != "binary_expression" {
+        return None;
+    }
+    let role = match cpp::text(node.child_by_field_name("operator")?, source) {
+        "&&" | "and" => "control_true_branch",
+        "||" | "or" => "control_false_branch",
+        _ => return None,
+    };
+    Some((
+        node.child_by_field_name("left")?,
+        node.child_by_field_name("right")?,
+        role,
+    ))
+}
+
+fn scalar_type(ty: &types::cpp::CppDeclaredType) -> bool {
+    ty.template_arguments.is_empty()
+        && !ty.name.is_empty()
+        && ty.name.split_whitespace().all(|word| {
+            matches!(
+                word,
+                "bool"
+                    | "char"
+                    | "wchar_t"
+                    | "char8_t"
+                    | "char16_t"
+                    | "char32_t"
+                    | "short"
+                    | "int"
+                    | "long"
+                    | "signed"
+                    | "unsigned"
+                    | "float"
+                    | "double"
+            )
+        })
 }

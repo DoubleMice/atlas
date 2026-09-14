@@ -53,6 +53,121 @@ fn inspect(source: &str, expression: &str) -> (Vec<(String, String)>, Vec<String
 }
 
 #[test]
+fn builtin_logical_rhs_has_a_guard_from_both_operand_types() {
+    for (op, role) in [
+        ("&&", "control_true_branch"),
+        ("||", "control_false_branch"),
+        ("and", "control_true_branch"),
+        ("or", "control_false_branch"),
+    ] {
+        let source = format!(
+            "bool first(); bool second(); bool run(bool outer) {{ if (!outer) return false; return !first() {op} !second(); }}"
+        );
+        assert_eq!(
+            inspect(&source, "second()").0,
+            vec![
+                ("control_false_branch".into(), "(!outer)".into()),
+                (role.into(), "!first()".into())
+            ],
+            "{source}"
+        );
+        for selection in [
+            "first()",
+            "return !first()",
+            "return !first() && !second();",
+        ] {
+            if source.contains(selection) {
+                assert_eq!(
+                    inspect(&source, selection).0,
+                    vec![("control_false_branch".into(), "(!outer)".into())]
+                );
+            }
+        }
+    }
+    let source = "bool run(bool first, int second) { return first && second; }";
+    assert_eq!(
+        inspect(source, "second").0,
+        vec![("control_true_branch".into(), "first".into())]
+    );
+}
+
+#[test]
+fn logical_overloads_and_unknown_types_do_not_establish_short_circuiting() {
+    for declarations in [
+        "struct Check {}; Check first(); Check second(); bool operator&&(Check, Check);",
+        "struct Check {}; bool first(); Check second(); bool operator&&(bool, Check);",
+        "enum Check { yes }; Check first(); Check second(); bool operator&&(Check, Check);",
+        "bool first();",
+    ] {
+        let source = format!(
+            "{declarations} bool run(bool outer) {{ if (!outer) return false; return first() && second(); }}"
+        );
+        let (controls, gaps) = inspect(&source, "second()");
+        assert_eq!(
+            controls,
+            vec![("control_false_branch".into(), "(!outer)".into())],
+            "{source}"
+        );
+        assert!(
+            gaps.contains(&"control_short_circuit_unestablished".into()),
+            "{source}: {gaps:?}"
+        );
+    }
+    let shadowed = "struct Check {}; bool operator&&(Check, Check); bool run(bool first) { { Check first; Check second; return first && second; } }";
+    assert!(inspect(shadowed, "second").0.is_empty());
+    let macro_operand = "#define NULL make_check()\nstruct Check {}; Check make_check(); bool second(); bool operator&&(Check, bool); bool run() { return NULL && second(); }";
+    let (conditions, gaps) = inspect(macro_operand, "second()");
+    assert!(conditions.is_empty());
+    assert!(gaps.contains(&"control_short_circuit_unestablished".into()));
+}
+
+#[test]
+fn logical_operand_budget_preserves_outer_guards() {
+    let source = format!(
+        "bool first(); bool second(); bool run(bool outer) {{ if (!outer) return false; return {}first() && second(); }}",
+        "!".repeat(257)
+    );
+    let (conditions, gaps) = inspect(&source, "second()");
+    assert_eq!(
+        conditions,
+        vec![("control_false_branch".into(), "(!outer)".into())]
+    );
+    assert!(gaps.contains(&"control_analysis_budget".into()));
+}
+
+#[test]
+fn logical_guards_compose_without_crossing_evaluation_boundaries() {
+    let source = "bool first(); bool second(); bool last(); bool run(bool choose) { return choose ? (first() || (second() && last())) : false; }";
+    let mut guards = inspect(source, "last()").0;
+    guards.sort();
+    assert_eq!(
+        guards,
+        vec![
+            ("control_false_branch".into(), "first()".into()),
+            ("control_true_branch".into(), "choose".into()),
+            ("control_true_branch".into(), "second()".into())
+        ]
+    );
+    for expression in [
+        "sizeof(first() && second())",
+        "noexcept(first() && second())",
+        "requires { first() && second(); }",
+    ] {
+        let source =
+            format!("bool first(); bool second(); void run() {{ auto v = {expression}; }}");
+        assert!(inspect(&source, "second()").0.is_empty(), "{source}");
+    }
+    let source = "bool first(); bool second(); void run() { auto pending = [saved = first() && second()] { return 7; }; }";
+    assert_eq!(
+        inspect(source, "second()").0,
+        vec![("control_true_branch".into(), "first()".into())]
+    );
+    assert!(inspect(source, "7").0.is_empty());
+    let source = "bool first(); bool second(); void run() { auto value = first() && second(); int after = 7; }";
+    assert!(inspect(source, "7").0.is_empty());
+}
+
+#[test]
 fn capture_initializer_conditions_belong_to_creation_and_not_the_body() {
     let source = "void run(bool enabled, int input) { if (!enabled) return; auto pending = [saved = input + 1] { int body_value = 7; }; }";
     assert_eq!(
