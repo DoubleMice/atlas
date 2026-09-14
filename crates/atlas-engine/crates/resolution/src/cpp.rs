@@ -581,14 +581,9 @@ impl TypeIndex {
             .initializers
             .get(&value.initializer_call.ok_or(LookupFailure::Unspecified)?)
             .ok_or(LookupFailure::Unspecified)?;
-        // Direct, qualified and implicit/this factory calls use the existing
-        // resolver. Deducing through arbitrary receiver expressions would need
-        // recursive expression typing beyond the recorded declaration facts.
-        if call.receiver.as_deref().is_some_and(|receiver| {
-            receiver != "this" && call.text != format!("{receiver}::{}", call.name)
-        }) {
-            return Err(LookupFailure::Unspecified);
-        }
+        // Reuse the same receiver and argument checks as an ordinary call.
+        // Unsupported expressions remain unknown there; recursive auto
+        // receivers share the deduction budget consumed above.
         let candidates = self
             .factory_candidates
             .get(&call.name)

@@ -2411,6 +2411,98 @@ int deduced_return() { auto factory = [] { return api::make_pointer(); }; auto d
 }
 
 #[test]
+fn auto_member_factory_results_reuse_receiver_and_argument_resolution() {
+    let header = r#"
+namespace api {
+struct Item { int read() { return 1; } };
+struct Factory {
+    Item* make();
+    Item* create(int value);
+    const Item& borrow();
+    Item* choose(int value);
+    Item* choose(double value);
+    virtual Item* dynamic();
+};
+struct Derived : Factory {};
+Factory* factory();
+struct Owner { Factory* source; int read(); };
+}
+namespace noise { struct Item { int read() { return 2; } }; }
+"#;
+    let body = r#"#include "api.hpp"
+int pointer(api::Factory* source) { auto value = source->make(); return value->read(); }
+int object(api::Factory& source) { auto value = source.make(); return value->read(); }
+int inherited(api::Derived* source) { auto value = source->make(); return value->read(); }
+int argument(api::Factory* source) { auto value = source->create(1); return value->read(); }
+int copy(api::Factory* source) { auto value = source->borrow(); return value.read(); }
+int chain() { auto source = api::factory(); auto value = source->make(); return value->read(); }
+int api::Owner::read() { auto value = source->make(); return value->read(); }
+int overload(api::Factory* source) { auto value = source->choose(1); return value->read(); }
+int dynamic(api::Factory* source) { auto value = source->dynamic(); return value->read(); }
+int conditional(bool flag, api::Factory* first, api::Factory* second) {
+    auto value = (flag ? first : second)->make(); return value->read();
+}
+"#;
+    let files = [("api.hpp", header), ("main.cpp", body)];
+    let result = analyze_targets(&files, false);
+    assert_eq!(result, analyze_targets(&files, true));
+    for call in [
+        "pointer:value->read",
+        "object:value->read",
+        "inherited:value->read",
+        "argument:value->read",
+        "copy:value.read",
+        "chain:value->read",
+        "api::Owner::read:value->read",
+    ] {
+        let target = result[call]
+            .as_ref()
+            .unwrap_or_else(|| panic!("{call}: {result:#?}"));
+        assert_eq!(target.name, "api::Item::read", "{call}");
+        assert_eq!(target.path, "api.hpp", "{call}");
+        assert!(target.has_body, "{call}");
+    }
+    // Overload ranking, virtual factory selection and conditional receivers
+    // retain their existing unsupported status, not a guessed return type.
+    for call in [
+        "overload:value->read",
+        "dynamic:value->read",
+        "conditional:value->read",
+    ] {
+        assert_eq!(result[call], None, "{call}: {result:#?}");
+    }
+    // No factory definition is needed, and the recorded declaration remains
+    // separate from the body reached after using its declared return type.
+    for call in ["pointer:source->make", "object:source.make"] {
+        assert!(!result[call].as_ref().unwrap().has_body, "{call}");
+    }
+}
+
+#[test]
+fn member_factory_auto_chains_keep_a_shared_deduction_limit() {
+    let header = "struct Item { int read(); }; struct Factory { Factory* next(); Item* make(); };";
+    let mut body = String::from(
+        "#include \"api.hpp\"\nint long_chain(Factory* start) { auto link0 = start->next();\n",
+    );
+    for i in 1..96 {
+        body.push_str(&format!("auto link{i} = link{}->next();\n", i - 1));
+    }
+    body.push_str("auto value = link95->make(); return value->read(); }");
+    let files = [("api.hpp", header), ("main.cpp", body.as_str())];
+    let result = analyze(&files, false);
+    assert_eq!(result, analyze(&files, true));
+    assert_eq!(
+        result["long_chain:start->next"].as_deref(),
+        Some("Factory::next")
+    );
+    assert_eq!(
+        result["long_chain:link0->next"].as_deref(),
+        Some("Factory::next")
+    );
+    assert_eq!(result["long_chain:value->read"], None);
+}
+
+#[test]
 fn factory_declaration_supplies_static_type_even_without_its_body() {
     let header = "namespace api { struct Device { int run() { return 1; } }; Device* make(); const Device& borrow(); }";
     let caller = "#include \"api.hpp\"\nint pointer() { auto p = api::make(); return p->run(); } int copy() { auto p = api::borrow(); return p.run(); }";
