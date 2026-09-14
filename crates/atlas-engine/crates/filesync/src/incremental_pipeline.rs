@@ -61,6 +61,12 @@ impl IncrementalPipeline {
         sink: &dyn ProgressSink,
         interrupted: &mut dyn FnMut() -> bool,
     ) -> Result<SyncStats> {
+        anyhow::ensure!(
+            self.store
+                .get_metadata(crate::index_pipeline::KEY_COMPILER_CALL_INPUT)?
+                .is_none_or(|hash| hash.is_empty()),
+            "compiler-enriched indexes require IndexPipeline with current compiler inputs or an explicit source-only rebuild"
+        );
         // ── Phase 1: ChangeDetection ───────────────────────────────
         let phase = PhaseName::Custom("ChangeDetection");
         if interrupted() {
@@ -356,6 +362,12 @@ impl IncrementalPipeline {
             }
 
             let t_count = Instant::now();
+            crate::cpp_annotations::prepare(
+                &self.store,
+                &self.project_root,
+                &self.mode,
+                interrupted,
+            )?;
             let unresolved_total = self
                 .store
                 .count_unresolved_references()
@@ -375,14 +387,14 @@ impl IncrementalPipeline {
             });
 
             let ps = sink.progress_state();
-            let graph_result = phase_resolve_and_build(&self.store, &self.project_root, ps)
+            let graph_result = phase_resolve_and_build(&self.store, &self.project_root, ps, None)
                 .map_err(|e| {
-                    sink.emit(ProgressEvent::Warning {
-                        phase,
-                        message: format!("{e:#}"),
-                    });
-                    e
-                })?;
+                sink.emit(ProgressEvent::Warning {
+                    phase,
+                    message: format!("{e:#}"),
+                });
+                e
+            })?;
 
             stats.new_edges = graph_result.edges_written;
             if graph_result.edges_written < graph_result.edges_built {

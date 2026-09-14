@@ -26,6 +26,7 @@ use types::*;
 /// by directory-tree proximity, reducing false matches across unrelated modules.
 #[derive(Debug)]
 pub struct GlobalSymbolIndex {
+    pub(crate) cpp_types: crate::cpp::TypeIndex,
     /// All symbols in the project.
     symbols: Vec<SymbolDef>,
     /// Pre-computed lower-case names for each symbol (same index as `symbols`).
@@ -109,6 +110,7 @@ impl GlobalSymbolIndex {
         }
 
         Ok(Self {
+            cpp_types: crate::cpp::TypeIndex::from_symbols(symbols, store.all_cpp_types()?, store)?,
             symbols: symbols.to_vec(),
             lower_names,
             by_name,
@@ -506,6 +508,7 @@ pub(crate) fn proximity_tier(ref_parent: Option<&String>, sym_parent: Option<&St
 /// only atomic reference-count increments.
 #[derive(Debug)]
 pub struct ResolutionContext {
+    pub(crate) bindings: Vec<BindingDef>,
     /// File being resolved.
     pub file: FileInfo,
 
@@ -601,6 +604,11 @@ impl ResolutionContext {
         }
 
         Ok(Self {
+            bindings: if file.language == Language::Cpp {
+                store.find_bindings_by_file(&file_id)?
+            } else {
+                Vec::new()
+            },
             file,
             symbols,
             scopes,
@@ -728,6 +736,7 @@ mod tests {
         }
 
         GlobalSymbolIndex {
+            cpp_types: Default::default(),
             symbols,
             lower_names,
             by_name,

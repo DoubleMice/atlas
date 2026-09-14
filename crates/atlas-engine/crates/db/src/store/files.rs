@@ -7,6 +7,36 @@ use super::Store;
 use crate::store_rows::row_to_file_info;
 
 impl Store {
+    /// Serialized diagnostic size for graph-cache admission before decoding.
+    pub fn file_diagnostics_bytes(&self) -> anyhow::Result<usize> {
+        let conn = self.lock_read();
+        let bytes: i64 = conn.query_row(
+            "SELECT COALESCE(SUM(length(CAST(d.diagnostics_json AS BLOB))), 0)
+             FROM file_diagnostics d JOIN files f ON f.file_id = d.file_id
+             WHERE d.content_hash = f.content_hash
+               AND (d.dataflow_version IS NULL OR d.dataflow_version = ?1)",
+            params![types::lazy::DATAFLOW_ANALYZER_VERSION],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(bytes).unwrap_or(usize::MAX))
+    }
+
+    /// Diagnostics produced by extraction of the current file contents.
+    /// Empty does not establish complete semantic coverage.
+    pub fn file_diagnostics(&self, file_id: &FileId) -> anyhow::Result<Vec<ExtractDiagnostic>> {
+        let conn = self.lock_read();
+        let json: Option<String> = conn.query_row(
+            "SELECT d.diagnostics_json FROM file_diagnostics d JOIN files f ON f.file_id = d.file_id
+             WHERE d.file_id = ?1 AND d.content_hash = f.content_hash
+               AND (d.dataflow_version IS NULL OR d.dataflow_version = ?2)",
+            params![file_id, types::lazy::DATAFLOW_ANALYZER_VERSION], |row| row.get(0),
+        ).optional()?;
+        match json {
+            Some(json) => Ok(serde_json::from_str(&json)?),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// Insert or update a file record.
     pub fn upsert_file(&self, file: &FileInfo) -> anyhow::Result<()> {
         let conn = self.lock();

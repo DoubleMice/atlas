@@ -38,7 +38,14 @@ pub fn detect_changes(root: &Path, store: &db::Store) -> Result<ChangedFiles> {
 
     // 1. Use the same discovery logic as normal index (atlasignore, gitignore,
     //    exclude dirs) to get the canonical file list.
-    let config = DiscoveryConfig::default();
+    let config = DiscoveryConfig {
+        file_languages: store
+            .get_metadata(crate::index_pipeline::KEY_FILE_LANGUAGES)?
+            .map(|value| serde_json::from_str(&value))
+            .transpose()?
+            .unwrap_or_default(),
+        ..Default::default()
+    };
     let discovered = crate::discovery::discover_files(root, &config)?;
 
     let mut current_hashes: HashMap<String, String> = HashMap::new();

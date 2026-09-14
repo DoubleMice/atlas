@@ -157,7 +157,7 @@ impl Store {
                 resolved_symbol_id = ?2,
                 resolved_confidence = ?3,
                 resolved_strategy = ?4,
-                resolved_provenance = ?5
+                resolved_provenance = ?5, failure_json = NULL
              WHERE reference_id = ?1",
             params![
                 reference_id,
@@ -187,7 +187,7 @@ impl Store {
                     resolved_symbol_id = ?2,
                     resolved_confidence = ?3,
                     resolved_strategy = ?4,
-                    resolved_provenance = ?5
+                    resolved_provenance = ?5, failure_json = NULL
                  WHERE reference_id = ?1",
             )?;
             for (ref_id, target) in resolutions {
@@ -205,6 +205,28 @@ impl Store {
 
     // ── Resolved fact invalidation (P2) ────────────────────────────────────
 
+    /// Clear selected primary targets and their resolution fingerprints. This
+    /// leaves references and supplemental graph edges intact; a building caller
+    /// is responsible for rebuilding edges before publishing the result.
+    pub fn invalidate_references(&self, references: &[ReferenceId]) -> anyhow::Result<()> {
+        self.with_transaction(|tx| {
+            let mut clear_state = tx.prepare(
+                "UPDATE extraction_state SET resolution_fingerprint = NULL
+                 WHERE file_id = (SELECT file_id FROM \"references\" WHERE reference_id = ?1)",
+            )?;
+            let mut clear_target = tx.prepare(
+                "UPDATE \"references\" SET resolved_symbol_id = NULL,
+                 resolved_confidence = NULL, resolved_strategy = NULL,
+                 resolved_provenance = NULL, failure_json = NULL WHERE reference_id = ?1",
+            )?;
+            for id in references {
+                clear_state.execute(params![id])?;
+                clear_target.execute(params![id])?;
+            }
+            Ok(())
+        })
+    }
+
     /// Clear all resolution results for references belonging to a file.
     ///
     /// This is called when a file is modified — the references themselves
@@ -219,7 +241,7 @@ impl Store {
                 resolved_symbol_id = NULL,
                 resolved_confidence = NULL,
                 resolved_strategy = NULL,
-                resolved_provenance = NULL
+                resolved_provenance = NULL, failure_json = NULL
                WHERE file_id = ?1 AND resolved_symbol_id IS NOT NULL"#,
             params![file_id],
         )?;
@@ -255,7 +277,7 @@ impl Store {
                     resolved_symbol_id = NULL,
                     resolved_confidence = NULL,
                     resolved_strategy = NULL,
-                    resolved_provenance = NULL
+                    resolved_provenance = NULL, failure_json = NULL
                    WHERE resolved_symbol_id IN (
                        SELECT symbol_id FROM symbols WHERE file_id = ?1
                    )"#,
@@ -353,7 +375,7 @@ impl Store {
                         resolved_symbol_id = NULL,
                         resolved_confidence = NULL,
                         resolved_strategy = NULL,
-                        resolved_provenance = NULL
+                        resolved_provenance = NULL, failure_json = NULL
                        WHERE resolved_symbol_id IN (
                            SELECT symbol_id FROM symbols WHERE file_id = ?1
                        )"#,
@@ -406,8 +428,8 @@ impl Store {
                 resolved_symbol_id = NULL,
                 resolved_confidence = NULL,
                 resolved_strategy = NULL,
-                resolved_provenance = NULL
-             WHERE resolved_symbol_id IS NOT NULL"#,
+                resolved_provenance = NULL, failure_json = NULL
+             WHERE (resolved_symbol_id IS NOT NULL OR failure_json IS NOT NULL)"#,
             [],
         )?;
         Ok(count)

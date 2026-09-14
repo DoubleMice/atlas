@@ -1565,6 +1565,7 @@ dependencies = [
  "graph",
  "rayon",
  "search",
+ "serde",
  "serde_json",
  "tempfile",
  "tracing",

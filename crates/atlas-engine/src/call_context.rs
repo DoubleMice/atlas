@@ -1,4 +1,4 @@
-//! Read-only, source-located investigation of stored calls.
+//! Read-only, source-located investigation of calls and non-call value uses.
 //!
 //! Lexical declarations and names written in type syntax are investigation
 //! context, not points-to results or new call edges. No resolution rows are written.
@@ -14,7 +14,15 @@ use db::Store;
 use tree_sitter::{Node, Parser, Tree};
 use types::*;
 
+mod control;
 mod cpp;
+mod function;
+mod operations;
+mod preprocessing;
+pub mod references;
+mod templates;
+pub mod value_flow;
+mod values;
 
 pub const MAX_CONTEXT_FILE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_CONTEXT_TOTAL_BYTES: usize = 32 * 1024 * 1024;
@@ -27,8 +35,50 @@ pub struct ContextLocation {
 }
 
 #[derive(Debug, Clone)]
+pub enum ContextSubject {
+    Call(Box<ReferenceUse>),
+    Region {
+        location: ContextLocation,
+        symbol_id: Option<SymbolId>,
+    },
+}
+
+impl ContextSubject {
+    pub fn call(&self) -> Option<&ReferenceUse> {
+        match self {
+            Self::Call(call) => Some(call),
+            Self::Region { .. } => None,
+        }
+    }
+
+    pub fn location(&self) -> ContextLocation {
+        match self {
+            Self::Call(call) => ContextLocation {
+                file_id: call.file_id,
+                range: call.range,
+            },
+            Self::Region { location, .. } => location.clone(),
+        }
+    }
+
+    fn reference(reference: &ReferenceUse) -> Self {
+        if reference.kind == ReferenceKind::Call {
+            Self::Call(Box::new(reference.clone()))
+        } else {
+            Self::Region {
+                location: ContextLocation {
+                    file_id: reference.file_id,
+                    range: reference.range,
+                },
+                symbol_id: reference.source_symbol,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CallContextItem {
-    pub call: ReferenceUse,
+    pub subject: ContextSubject,
     /// The item's role in an investigation, never a relationship strength.
     pub role: &'static str,
     pub location: ContextLocation,
@@ -39,7 +89,7 @@ pub struct CallContextItem {
 
 #[derive(Debug, Clone)]
 pub struct CallContextGap {
-    pub call: ReferenceUse,
+    pub subject: ContextSubject,
     pub code: &'static str,
     pub message: String,
     pub related_locations: Vec<ContextLocation>,
@@ -56,6 +106,7 @@ pub struct CallContextResult {
 struct ParsedSource {
     source: String,
     tree: Tree,
+    cpp: Option<types::cpp::CppFileTypes>,
 }
 
 struct Investigation<'a> {
@@ -64,11 +115,13 @@ struct Investigation<'a> {
     canceled: &'a dyn Fn() -> bool,
     parsed: BTreeMap<FileId, Result<Arc<ParsedSource>, String>>,
     result: CallContextResult,
+    symbol_static: BTreeMap<SymbolId, bool>,
 }
 
-/// Inspect existing references that intersect a source byte range. This uses
+/// Inspect stored calls that intersect a source byte range, or written C++ value
+/// uses when the region has no stored calls. This uses
 /// stored lexical scopes/bindings and parses only the source needed for their
-/// declaration/initializer syntax. Currently C++ supplies receiver context;
+/// declaration/initializer syntax. Currently C++ supplies receiver and argument context;
 /// unsupported languages retain an explicit limitation. Results never alter Store.
 pub fn inspect_call_context(
     store: &Store,
@@ -76,6 +129,7 @@ pub fn inspect_call_context(
     path: &str,
     start_byte: u32,
     end_byte: u32,
+    include_control_conditions: bool,
     canceled: &dyn Fn() -> bool,
 ) -> anyhow::Result<CallContextResult> {
     let mut query = Investigation {
@@ -84,6 +138,7 @@ pub fn inspect_call_context(
         canceled,
         parsed: BTreeMap::new(),
         result: CallContextResult::default(),
+        symbol_static: BTreeMap::new(),
     };
     query.check()?;
     let Some(file) = store
@@ -102,24 +157,36 @@ pub fn inspect_call_context(
                 && start_byte < r.range.end_byte
         })
         .collect();
-    if calls.is_empty() {
-        return Ok(query.result);
+    if include_control_conditions {
+        query.control_conditions(file.file_id, start_byte, end_byte)?;
     }
     if file.language != Language::Cpp {
         for call in calls {
-            query.gap(call, "syntax_context_unsupported", "Receiver context is not implemented for this language; stored calls and name candidates remain available.", vec![])?;
+            query.gap(call, "syntax_context_unsupported", "Receiver and argument context are not implemented for this language; stored calls and name candidates remain available.", vec![])?;
         }
         return Ok(query.result);
     }
+    query.preprocessing_context(file.file_id, start_byte, end_byte)?;
+    query.operation_regions(file.file_id, start_byte, end_byte)?;
+    query.symbol_static = store
+        .find_symbols_by_file(&file.file_id)?
+        .into_iter()
+        .map(|s| (s.id, s.static_))
+        .collect();
     let bindings = store.find_bindings_by_file(&file.file_id)?;
     let scopes: BTreeMap<_, _> = store
         .find_scopes_by_file(&file.file_id)?
         .into_iter()
         .map(|s| (s.id, s))
         .collect();
+    if calls.is_empty() {
+        query.values(&file, start_byte, end_byte, &references, &bindings, &scopes)?;
+    }
     for call in calls {
         query.check()?;
+        query.template_callee(call)?;
         query.receiver(call, &references, &bindings, &scopes)?;
+        query.arguments(call, &bindings, &scopes)?;
     }
     query.check()?;
     Ok(query.result)
@@ -151,7 +218,7 @@ impl Investigation<'_> {
     ) -> anyhow::Result<()> {
         self.reserve_item()?;
         self.result.items.push(CallContextItem {
-            call: call.clone(),
+            subject: ContextSubject::reference(call),
             role,
             location,
             symbol_id,
@@ -170,7 +237,7 @@ impl Investigation<'_> {
     ) -> anyhow::Result<()> {
         self.reserve_item()?;
         self.result.gaps.push(CallContextGap {
-            call: call.clone(),
+            subject: ContextSubject::reference(call),
             code,
             message: message.into(),
             related_locations,
@@ -224,8 +291,28 @@ impl Investigation<'_> {
             bytes.extend_from_slice(&buffer[..n]);
         }
         let source = String::from_utf8(bytes).map_err(|_| "context source is not valid UTF-8")?;
-        let frontend =
-            extraction::create_frontend(file.language).ok_or("source grammar is unavailable")?;
+        let cpp = if file.language == Language::Cpp {
+            self.store
+                .cpp_types_for_file(&id)
+                .map_err(|e| e.to_string())?
+        } else {
+            None
+        };
+        let frontend = if file.language == Language::Cpp {
+            let (ranges, members) = cpp
+                .as_ref()
+                .map(|facts| {
+                    (
+                        facts.normalized_annotations.clone(),
+                        facts.normalized_member_macros.clone(),
+                    )
+                })
+                .unwrap_or_default();
+            extraction::cpp_annotations::frontend(ranges, members)
+        } else {
+            extraction::create_frontend(file.language)
+        }
+        .ok_or("source grammar is unavailable")?;
         let mut parser = Parser::new();
         parser
             .set_language(&frontend.parser.tree_sitter_language())
@@ -248,8 +335,12 @@ impl Investigation<'_> {
                 Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
             )
             .ok_or("context parse was interrupted")?;
+        let tree = frontend
+            .parser
+            .refine_tree(&parser_source, tree, self.canceled)
+            .ok_or("context refinement was interrupted")?;
         drop(parser_source);
-        Ok(ParsedSource { source, tree })
+        Ok(ParsedSource { source, tree, cpp })
     }
 
     fn receiver(
@@ -266,7 +357,12 @@ impl Investigation<'_> {
             Ok(source) => source,
             Err(error) => return self.gap(call, "source_context_unavailable", error, vec![]),
         };
-        let Some(receiver) = cpp::receiver(parsed.tree.root_node(), call.range) else {
+        let receiver = if call.kind == ReferenceKind::Usage {
+            cpp::expression(parsed.tree.root_node(), call.range)
+        } else {
+            cpp::receiver(parsed.tree.root_node(), call.range)
+        };
+        let Some(receiver) = receiver else {
             // Written namespace/type qualification is not an object receiver.
             if call
                 .receiver
@@ -294,7 +390,12 @@ impl Investigation<'_> {
         if receiver.kind() == "call_expression" {
             return self.initializer(call, receiver, references, location);
         }
-        let Some((name, explicit_member)) = cpp::receiver_name(receiver, &parsed.source) else {
+        let name = if call.kind == ReferenceKind::FieldAccess && receiver.kind() == "this" {
+            Some((call.name.as_str(), true))
+        } else {
+            cpp::receiver_name(receiver, &parsed.source)
+        };
+        let Some((name, explicit_member)) = name else {
             return self.gap(call, "receiver_expression_unsupported", "The receiver is not a simple lexical identifier or direct call; inspect its source expression.", vec![location]);
         };
         let found = if explicit_member {
@@ -306,26 +407,57 @@ impl Investigation<'_> {
                 call.scope_id,
                 name,
                 receiver.start_byte() as u32,
+                parsed
+                    .cpp
+                    .as_ref()
+                    .map_or(&[], |facts| facts.lambda_captures.as_slice()),
             )
         };
         if found.is_empty() {
-            if cpp::inside_lambda(receiver) {
-                return self.gap(call, "receiver_capture_unverified", "No lexical binding accounts for the lambda receiver; captures and enclosing-object access must be checked before attributing a class field.", vec![location]);
-            }
-            if self.member_receiver(call, name, location.clone())? {
+            let capture_available = !cpp::inside_lambda(receiver)
+                || parsed.cpp.as_ref().is_some_and(|facts| {
+                    resolution::cpp_captures::field_access(
+                        facts,
+                        call,
+                        (!explicit_member).then_some(name),
+                        |id| self.symbol_static.get(&id).copied(),
+                    )
+                    .is_some()
+                });
+            if self.member_receiver(call, name, location.clone(), capture_available)? {
                 return Ok(());
             }
-            return self.gap(call, "receiver_binding_unavailable", "No recorded lexical binding or direct field in the caller's class accounts for this receiver. Inheritance, captures and missing declarations remain open.", vec![location]);
+            return self.gap(call, "receiver_binding_unavailable", "No recorded lexical binding or direct field in the caller's class accounts for this receiver. Namespace lookup, inheritance and missing declarations remain open.", vec![location]);
         }
         if found.len() > 1 {
             self.gap(call, "receiver_binding_ambiguous", "Several declarations introduce this name in the nearest recorded scope; all are retained without selecting a value.", found.iter().map(|b| ContextLocation { file_id: b.file_id, range: b.range }).collect())?;
         }
+        let mut has_declaration = false;
         for binding in found {
             self.check()?;
+            if cpp::inside_lambda(receiver)
+                && !parsed.cpp.as_ref().is_some_and(|facts| {
+                    facts
+                        .values
+                        .iter()
+                        .find(|value| value.binding_id == Some(binding.id))
+                        .is_some_and(|value| {
+                            resolution::cpp_captures::local_effect(facts, name, value, call)
+                                .is_some()
+                        })
+                })
+            {
+                self.gap(call, "receiver_capture_unverified", "Recorded capture facts do not establish access to this lexical declaration from the closure. The declaration and receiver remain source locations for investigation.", vec![
+                    location.clone(),
+                    ContextLocation { file_id: binding.file_id, range: binding.range },
+                ])?;
+                continue;
+            }
+            has_declaration = true;
             let Some(syntax) = cpp::binding(parsed.tree.root_node(), binding.range) else {
                 self.item(
                     call,
-                    "receiver_binding",
+                    binding_role(call),
                     ContextLocation {
                         file_id: binding.file_id,
                         range: binding.range,
@@ -346,15 +478,275 @@ impl Investigation<'_> {
                 continue;
             };
             let declaration = loc(call.file_id, syntax.declaration);
-            self.item(call, "receiver_binding", declaration.clone(), binding.symbol_id, vec![location.clone()], format!("Lexical declaration of {name}; an initializer is not proof of the receiver's current value."))?;
+            self.item(call, binding_role(call), declaration.clone(), binding.symbol_id, vec![location.clone()], format!("Lexical declaration of {name}; an initializer is not proof of the receiver's current value."))?;
             if let Some(ty) = syntax.type_node {
-                self.type_context(call, ty, &parsed, declaration.clone())?;
+                self.type_context(call, ty, &parsed, declaration.clone(), true)?;
             }
             if let Some(value) = syntax.initializer {
                 self.initializer(call, value, references, declaration)?;
             }
         }
+        if !has_declaration {
+            return Ok(());
+        }
         self.gap(call, "receiver_semantics_unverified", "Declaration/initializer/type syntax is available, but assignments, aliases, template semantics and runtime dispatch have not been established by this investigation.", vec![location])
+    }
+
+    fn arguments(
+        &mut self,
+        call: &ReferenceUse,
+        bindings: &[BindingDef],
+        scopes: &BTreeMap<ScopeId, ScopeDef>,
+    ) -> anyhow::Result<()> {
+        let arguments = match self.store.find_callsite_by_reference_id(&call.id)? {
+            Some(site) => site.args,
+            None if call.arity == Some(0) => return Ok(()),
+            None => {
+                // Persisted callsites require a caller identity. Written argument
+                // positions do not: reuse the extraction frontend for this exact
+                // reference, without creating a Callsite, caller or target binding.
+                let parsed = match self.source(call.file_id) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        return self.gap(call, "source_context_unavailable", error, vec![]);
+                    }
+                };
+                let parts = extraction::callsite_spec::create_extractor(Language::Cpp)
+                    .extract_callsite(
+                        parsed.tree.root_node(),
+                        call.range.start_byte as usize,
+                        call.range.end_byte as usize,
+                        &parsed.source,
+                    )
+                    .filter(|parts| {
+                        parts.callee_range.start_byte == call.range.start_byte
+                            && parts.callee_range.end_byte == call.range.end_byte
+                            && call
+                                .arity
+                                .is_none_or(|arity| parts.argument_ranges.len() == arity as usize)
+                    });
+                let Some(parts) = parts else {
+                    return self.gap(call, "argument_locations_unavailable", "Argument syntax could not be matched to this recorded callee and argument count; inspect the original call source.", vec![]);
+                };
+                parts
+                    .argument_ranges
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, range)| ArgumentFact {
+                        index: index as u32,
+                        name: None,
+                        value: parsed.source[range.start_byte as usize..range.end_byte as usize]
+                            .to_owned(),
+                        range: Some(range),
+                        data_node_id: None,
+                    })
+                    .collect()
+            }
+        };
+        if arguments.is_empty() {
+            return Ok(());
+        }
+        self.argument_parameters(call, &arguments)?;
+        let parsed = match self.source(call.file_id) {
+            Ok(source) => source,
+            Err(error) => return self.gap(call, "source_context_unavailable", error, vec![]),
+        };
+        let closures = parsed
+            .cpp
+            .as_ref()
+            .map_or(&[][..], |facts| facts.lambda_captures.as_slice());
+        // Copy identities before mutating the investigation; these are existing
+        // callable entities, never identities manufactured by the source reparse.
+        let callable_ids: BTreeMap<_, _> = closures
+            .iter()
+            .filter_map(|lambda| {
+                lambda
+                    .symbol_id
+                    .filter(|id| self.symbol_static.contains_key(id))
+                    .map(|id| ((lambda.range.start_byte, lambda.range.end_byte), id))
+            })
+            .collect();
+        let mut argument_locations = vec![];
+        for argument in arguments {
+            self.check()?;
+            let Some(range) = argument.range else {
+                self.gap(
+                    call,
+                    "argument_locations_unavailable",
+                    format!(
+                        "Argument {} has no recorded source range.",
+                        argument.index + 1
+                    ),
+                    vec![],
+                )?;
+                continue;
+            };
+            let location = ContextLocation {
+                file_id: call.file_id,
+                range,
+            };
+            argument_locations.push(location.clone());
+            self.item(call, "argument_expression", location.clone(), callable_ids.get(&(range.start_byte, range.end_byte)).copied(), vec![], format!("Written argument {}; its position does not establish a runtime value or parameter mapping.", argument.index + 1))?;
+            let Some(expression) = cpp::expression(parsed.tree.root_node(), range) else {
+                self.gap(call, "argument_syntax_unavailable", "The recorded argument range cannot be associated with an exact syntax node; inspect its source.", vec![location])?;
+                continue;
+            };
+            if expression.has_error() {
+                self.gap(call, "argument_syntax_unavailable", "The argument contains parser errors; its written location remains available without selecting a binding.", vec![location])?;
+                continue;
+            }
+            // Only plain local/parameter names have declaration navigation here.
+            // Other expressions remain independently readable, not silently dropped.
+            if expression.kind() != "identifier" {
+                continue;
+            }
+            let name = cpp::text(expression, &parsed.source);
+            let found = visible_bindings(
+                bindings,
+                scopes,
+                call.scope_id,
+                name,
+                range.start_byte,
+                closures,
+            );
+            if found.is_empty() {
+                self.gap(call, "argument_binding_unavailable", "No recorded lexical declaration accounts for this argument name. Fields, globals, function names and missing declarations require further investigation.", vec![location])?;
+                continue;
+            }
+            if found.len() > 1 {
+                self.gap(call, "argument_binding_ambiguous", "Several declarations introduce this argument name in the nearest recorded scope; retain all origins without selecting a value.", found.iter().map(|binding| ContextLocation { file_id: binding.file_id, range: binding.range }).collect())?;
+            }
+            for binding in found {
+                let origin = ContextLocation {
+                    file_id: binding.file_id,
+                    range: binding.range,
+                };
+                if cpp::inside_lambda(expression)
+                    && !parsed.cpp.as_ref().is_some_and(|facts| {
+                        facts
+                            .values
+                            .iter()
+                            .find(|value| value.binding_id == Some(binding.id))
+                            .is_some_and(|value| {
+                                resolution::cpp_captures::local_effect(facts, name, value, call)
+                                    .is_some()
+                            })
+                    })
+                {
+                    self.gap(call, "argument_capture_unverified", "Recorded captures do not establish access to this lexical declaration from the closure; inspect the use and declaration separately.", vec![location.clone(), origin])?;
+                    continue;
+                }
+                let Some(syntax) = cpp::binding_origin(parsed.tree.root_node(), binding.range)
+                else {
+                    self.item(
+                        call,
+                        "argument_binding",
+                        origin.clone(),
+                        binding.symbol_id,
+                        vec![location.clone()],
+                        "Recorded lexical declaration; initializer syntax is unavailable.",
+                    )?;
+                    self.gap(
+                        call,
+                        "argument_syntax_unavailable",
+                        "Cannot locate the argument declaration's syntax.",
+                        vec![origin],
+                    )?;
+                    continue;
+                };
+                let declaration = loc(call.file_id, syntax.declaration);
+                self.item(call, "argument_binding", declaration.clone(), binding.symbol_id, vec![location.clone()], format!("Recorded lexical declaration of argument {name}; this is not a reaching-value or resolved-symbol-reference result."))?;
+                if syntax.declaration.has_error() {
+                    self.gap(call, "argument_declaration_syntax_partial", "The declaration contains parser errors. Its written declaration/initializer extents are investigation candidates; no type, value or execution conclusion follows.", vec![location.clone(), declaration.clone()])?;
+                }
+                if !syntax.declaration.has_error()
+                    && let Some(ty) = syntax.type_node
+                {
+                    self.type_context(call, ty, &parsed, declaration.clone(), false)?;
+                }
+                if let Some(initializer) = syntax.initializer {
+                    let at = loc(call.file_id, initializer);
+                    let symbol = callable_ids
+                        .get(&(at.range.start_byte, at.range.end_byte))
+                        .copied();
+                    self.item(call, "argument_initializer", at, symbol, vec![location.clone(), declaration], "Expression written at the argument's declaration. Later assignments and aliasing are not tracked; an indexed callable ID identifies its body, not whether this call executes it.")?;
+                }
+            }
+        }
+        self.gap(call, "argument_value_unestablished", "Argument source and available declaration origins are investigation context. Reaching values, argument-to-parameter propagation and callback execution have not been computed by this query.", argument_locations)
+    }
+
+    fn argument_parameters(
+        &mut self,
+        call: &ReferenceUse,
+        arguments: &[ArgumentFact],
+    ) -> anyhow::Result<()> {
+        let Some(target) = self
+            .store
+            .find_resolved_callsite_by_reference_id(&call.id)?
+            .map(|site| self.store.find_symbol_by_id(&site.callee))
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(());
+        };
+        if target.language != Language::Cpp {
+            return Ok(());
+        }
+        let origin = ContextLocation {
+            file_id: target.file_id,
+            range: target.name_range,
+        };
+        let actual_source = match self.source(call.file_id) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.gap(call, "source_context_unavailable", error, vec![]),
+        };
+        if arguments.iter().any(|argument| {
+            argument
+                .range
+                .and_then(|range| cpp::expression(actual_source.tree.root_node(), range))
+                .is_none_or(|node| node.has_error() || node.kind() == "parameter_pack_expansion")
+        }) {
+            return self.gap(call, "parameter_positions_unavailable", "Argument syntax is incomplete or contains an unexpanded parameter pack; written argument positions cannot be mapped to this target's parameters.", vec![origin]);
+        }
+        let parsed = match self.source(target.file_id) {
+            Ok(parsed) => parsed,
+            Err(error) => return self.gap(call, "source_context_unavailable", error, vec![origin]),
+        };
+        let Some(parameters) = cpp::callable(parsed.tree.root_node(), target.name_range)
+            .and_then(|syntax| syntax.parameters)
+        else {
+            return self.gap(call, "parameter_positions_unavailable", "The recorded target's parameter syntax is unavailable; inspect the original declaration before mapping arguments.", vec![origin]);
+        };
+        let mut cursor = parameters.walk();
+        let parameters: Vec<_> = parameters
+            .named_children(&mut cursor)
+            .filter(|node| node.kind() != "comment")
+            .collect();
+        if parameters.iter().any(|parameter| {
+            !matches!(
+                parameter.kind(),
+                "parameter_declaration" | "optional_parameter_declaration"
+            ) || parameter.has_error()
+                || parameter
+                    .child(0)
+                    .is_some_and(|child| child.kind() == "this")
+        }) || arguments
+            .iter()
+            .any(|argument| argument.index as usize >= parameters.len())
+        {
+            return self.gap(call, "parameter_positions_unavailable", "Parameter packs, variadic or explicit-object parameters, syntax recovery or incompatible argument positions prevent this positional mapping. No written parameter is selected.", vec![origin]);
+        }
+        for argument in arguments {
+            self.check()?;
+            let Some(range) = argument.range else {
+                continue;
+            };
+            self.item(call, "argument_parameter", loc(target.file_id, parameters[argument.index as usize]), Some(target.id),
+                vec![ContextLocation { file_id: call.file_id, range }],
+                format!("Written parameter {} of the recorded call target corresponds positionally to argument {}. The entity ID identifies that callee, not the parameter. Conversion, reaching values and callback execution are not established by this correspondence.", argument.index + 1, argument.index + 1))?;
+        }
+        Ok(())
     }
 
     fn member_receiver(
@@ -362,6 +754,7 @@ impl Investigation<'_> {
         call: &ReferenceUse,
         name: &str,
         receiver: ContextLocation,
+        capture_available: bool,
     ) -> anyhow::Result<bool> {
         let Some(caller) = call
             .source_symbol
@@ -400,6 +793,15 @@ impl Investigation<'_> {
         if fields.is_empty() {
             return Ok(false);
         }
+        if !capture_available {
+            let mut locations = vec![receiver];
+            locations.extend(fields.iter().map(|field| ContextLocation {
+                file_id: field.file_id,
+                range: field.name_range,
+            }));
+            self.gap(call, "receiver_capture_unverified", "Recorded capture and enclosing-object facts do not support accessing these outer fields. The locations are investigation candidates; unsupported syntax is not proof that a capture is absent.", locations)?;
+            return Ok(true);
+        }
         if fields.len() > 1 {
             self.gap(call, "receiver_binding_ambiguous", "Several indexed class-field declarations account for this name; all are retained without selecting a build variant or object value.", fields.iter().map(|f| ContextLocation { file_id: f.file_id, range: f.name_range }).collect())?;
         }
@@ -413,7 +815,7 @@ impl Investigation<'_> {
                 Err(error) => {
                     self.item(
                         call,
-                        "receiver_binding",
+                        binding_role(call),
                         at.clone(),
                         Some(field.id),
                         vec![receiver.clone()],
@@ -426,7 +828,7 @@ impl Investigation<'_> {
             let Some(syntax) = cpp::binding(parsed.tree.root_node(), field.name_range) else {
                 self.item(
                     call,
-                    "receiver_binding",
+                    binding_role(call),
                     at.clone(),
                     Some(field.id),
                     vec![receiver.clone()],
@@ -441,9 +843,9 @@ impl Investigation<'_> {
                 continue;
             };
             let declaration = loc(field.file_id, syntax.declaration);
-            self.item(call, "receiver_binding", declaration.clone(), Some(field.id), vec![receiver.clone()], "Field declared in the caller's class; this establishes a declaration origin, not the receiver's current value or smart-pointer semantics.")?;
+            self.item(call, binding_role(call), declaration.clone(), Some(field.id), vec![receiver.clone()], "Field declared in the caller's class; this establishes a declaration origin, not the receiver's current value or smart-pointer semantics.")?;
             if let Some(ty) = syntax.type_node {
-                self.type_context(call, ty, &parsed, declaration)?;
+                self.type_context(call, ty, &parsed, declaration, true)?;
             }
         }
         self.gap(call, "receiver_semantics_unverified", "Class-field declarations and written types are available. Initializers, assignments, aliases, dereference operators and runtime dispatch remain unverified.", vec![receiver])?;
@@ -539,7 +941,7 @@ impl Investigation<'_> {
                 basis,
             )?;
             if let Some(ty) = declaration.type_node {
-                self.type_context(call, ty, &file, at)?;
+                self.type_context(call, ty, &file, at, true)?;
             } else {
                 self.gap(
                     call,
@@ -561,12 +963,13 @@ impl Investigation<'_> {
         ty: Node<'_>,
         parsed: &ParsedSource,
         declaration: ContextLocation,
+        receiver_members: bool,
     ) -> anyhow::Result<()> {
-        for name_node in cpp::type_names(ty) {
+        for name_node in cpp::type_names(ty, &parsed.source) {
             self.check()?;
             let name = cpp::text(name_node, &parsed.source);
             let mention = loc(declaration.file_id, name_node);
-            self.item(call, "type_reference", mention.clone(), None, vec![declaration.clone()], format!("{name} is written in declaration type syntax. A template argument or alias name is not the effective receiver type."))?;
+            self.item(call, "type_reference", mention.clone(), None, vec![declaration.clone()], format!("{name} is written in declaration type syntax. A template argument or alias name is a source clue, not a resolved or effective type."))?;
             let symbols = self.store.find_symbols_by_name(name)?;
             let mut found = false;
             for symbol in symbols.into_iter().filter(|s| {
@@ -586,6 +989,23 @@ impl Investigation<'_> {
                     range: symbol.name_range,
                 };
                 self.item(call, "type_declaration", at.clone(), Some(symbol.id), vec![mention.clone()], "Indexed type declaration with this written name; qualification, aliases and applicability remain to be checked.")?;
+                if symbol.kind == SymbolKind::TypeAlias
+                    && let Some(facts) = self.store.cpp_types_for_file(&symbol.file_id)?
+                    && let Some(alias) = facts
+                        .aliases
+                        .iter()
+                        .find(|alias| alias.symbol_id == symbol.id && alias.target.is_some())
+                {
+                    self.item(call, "type_alias_target", ContextLocation {
+                        file_id: symbol.file_id,
+                        range: alias.target_range,
+                    }, None, vec![at.clone(), mention.clone()],
+                        "Written target syntax of this indexed alias candidate. Its name, macro expansion and applicability are not resolved; follow the source without treating this as a type binding.")?;
+                }
+                self.type_recovery_context(call, &symbol, &at)?;
+                if !receiver_members {
+                    continue;
+                }
                 for member in self
                     .store
                     .find_symbols_by_qname(&format!("{}::{}", symbol.qualified_name, call.name))?
@@ -603,6 +1023,63 @@ impl Investigation<'_> {
         }
         Ok(())
     }
+
+    fn type_recovery_context(
+        &mut self,
+        call: &ReferenceUse,
+        symbol: &SymbolDef,
+        declaration: &ContextLocation,
+    ) -> anyhow::Result<()> {
+        if !matches!(symbol.kind, SymbolKind::Class | SymbolKind::Struct)
+            || self
+                .store
+                .get_file(&symbol.file_id)?
+                .is_none_or(|file| file.status == ParseStatus::Success)
+        {
+            return Ok(());
+        }
+        // Clean candidate files need no additional read. Partially parsed
+        // files reuse the same bounded, annotation-aware parser as receivers.
+        let parsed = match self.source(symbol.file_id) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return self.gap(
+                    call,
+                    "source_context_unavailable",
+                    error,
+                    vec![declaration.clone()],
+                );
+            }
+        };
+        let Some(record) = cpp::record(parsed.tree.root_node(), symbol.name_range) else {
+            return self.gap(
+                call,
+                "candidate_type_syntax_unavailable",
+                format!("Cannot associate candidate type {} with its own class/struct syntax. Candidate applicability and declaration coverage remain unverified.", symbol.qualified_name),
+                vec![declaration.clone()],
+            );
+        };
+        let mut cursor = record.walk();
+        loop {
+            self.check()?;
+            let node = cursor.node();
+            if node.is_error() || node.is_missing() {
+                self.gap(
+                    call,
+                    "candidate_type_syntax_recovery",
+                    format!("Candidate type {} has {}. Its applicability and declaration/body coverage remain unverified; parser recovery is not a compiler diagnostic or a proven cause of this call's unresolved target.", symbol.qualified_name, if node.is_missing() { "a missing-token anchor (zero-width)" } else { "an unparsed region" }),
+                    vec![declaration.clone(), loc(symbol.file_id, node)],
+                )?;
+            } else if node.has_error() && cursor.goto_first_child() {
+                continue;
+            }
+            while !cursor.goto_next_sibling() {
+                if !cursor.goto_parent() {
+                    return Ok(());
+                }
+            }
+        }
+    }
 }
 
 fn visible_bindings<'a>(
@@ -611,6 +1088,7 @@ fn visible_bindings<'a>(
     mut scope: Option<ScopeId>,
     name: &str,
     before: u32,
+    closures: &[types::cpp::CppLambdaCapture],
 ) -> Vec<&'a BindingDef> {
     let mut visited = BTreeSet::new();
     while let Some(id) = scope {
@@ -627,7 +1105,9 @@ fn visible_bindings<'a>(
         let Some(current) = scopes.get(&id) else {
             break;
         };
-        if current.kind == ScopeKind::Function {
+        if current.kind == ScopeKind::Function
+            && !closures.iter().any(|lambda| lambda.range == current.range)
+        {
             break;
         }
         scope = current.parent_id;
@@ -639,6 +1119,17 @@ fn loc(file_id: FileId, node: Node<'_>) -> ContextLocation {
     ContextLocation {
         file_id,
         range: cpp::range(node),
+    }
+}
+
+fn binding_role(reference: &ReferenceUse) -> &'static str {
+    if reference.kind == ReferenceKind::Usage
+        || (reference.kind == ReferenceKind::FieldAccess
+            && reference.receiver.as_deref() == Some("this"))
+    {
+        "value_binding"
+    } else {
+        "receiver_binding"
     }
 }
 

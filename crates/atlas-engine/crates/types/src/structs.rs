@@ -712,6 +712,9 @@ pub struct FileFacts {
     /// File metadata.
     pub file: FileInfo,
 
+    /// Written C++ types, available with structural/resolution-symbol facts.
+    pub cpp_types: Option<crate::cpp::CppFileTypes>,
+
     /// All symbol definitions found in this file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub symbols: Vec<SymbolDef>,
@@ -745,6 +748,10 @@ pub struct FileFacts {
     pub diagnostics: Vec<ExtractDiagnostic>,
 
     // ── Binding + Dataflow ──
+    /// Producer version for a supported dataflow computation; absent for
+    /// structural-only facts or data without established computation identity.
+    pub dataflow_version: Option<u32>,
+
     /// Lexical binding definitions (per-function variables/parameters).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub bindings: Vec<BindingDef>,

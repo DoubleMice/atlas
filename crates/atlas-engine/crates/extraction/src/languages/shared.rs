@@ -639,8 +639,9 @@ pub fn make_df_assign_value(
     call_kinds: &[&str],
 ) -> (Option<DataNode>, Option<DataFlowEdge>) {
     let text = super::node_text(node, source).unwrap_or_default();
-    let callsite_id = find_call_expression(node, call_kinds)
-        .map(|ce| CallsiteId::from_file_byte(&file_id, ce.start_byte() as u32));
+    let callsite_id = find_call_expression(node, call_kinds).map(|ce| {
+        CallsiteId::from_file_range(&file_id, ce.start_byte() as u32, ce.end_byte() as u32)
+    });
     let node_id = DataNodeId::generate(
         &file_id,
         None::<&SymbolId>,
@@ -658,6 +659,40 @@ pub fn make_df_assign_value(
             binding_id: None,
             callsite_id,
             name: Some(text),
+            access_path: None,
+            arg_index: None,
+            range,
+        }),
+        None,
+    )
+}
+
+/// Capture an invocation/construction result without assuming a recorded call
+/// or a return-value mapping. The common result pass attaches a real invocation
+/// identity only for a supported ordinary call with the exact same range.
+pub fn make_df_call_result(
+    file_id: FileId,
+    node: tree_sitter::Node,
+    source: &str,
+    range: TextRange,
+) -> (Option<DataNode>, Option<DataFlowEdge>) {
+    let id = DataNodeId::generate(
+        &file_id,
+        None::<&SymbolId>,
+        "call_return",
+        Some(&format!("syntax:{}..{}", range.start_byte, range.end_byte)),
+        None,
+        range.start_byte,
+    );
+    (
+        Some(DataNode {
+            id,
+            file_id,
+            function_id: None,
+            kind: DataNodeKind::CallReturn,
+            binding_id: None,
+            callsite_id: None,
+            name: super::node_text(node, source),
             access_path: None,
             arg_index: None,
             range,
@@ -685,8 +720,15 @@ pub fn make_df_call_arg(
     call_kinds: &[&str],
 ) -> (Option<DataNode>, Option<DataFlowEdge>) {
     let text = super::node_text(node, source).unwrap_or_default();
-    let callsite_id = find_call_expression(node, call_kinds)
-        .map(|ce| CallsiteId::from_file_byte(&file_id, ce.start_byte() as u32));
+    // The captured value belongs to the receiving call. If that value is
+    // itself a call expression, starting at the node would attach the outer
+    // argument to its inner evaluation instead.
+    let callsite_id = node
+        .parent()
+        .and_then(|parent| find_call_expression(parent, call_kinds))
+        .map(|ce| {
+            CallsiteId::from_file_range(&file_id, ce.start_byte() as u32, ce.end_byte() as u32)
+        });
     let node_id = DataNodeId::generate(
         &file_id,
         None::<&SymbolId>,

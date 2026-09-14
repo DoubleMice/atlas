@@ -674,7 +674,13 @@ fn normalize_java_dataflow_builder(
                     node,
                     &["method_invocation", "object_creation_expression"],
                 )
-                .map(|ce| types::ids::CallsiteId::from_file_byte(&file_id, ce.start_byte() as u32));
+                .map(|ce| {
+                    types::ids::CallsiteId::from_file_range(
+                        &file_id,
+                        ce.start_byte() as u32,
+                        ce.end_byte() as u32,
+                    )
+                });
                 let node_id = DataNodeId::generate(
                     &file_id,
                     None::<&SymbolId>,

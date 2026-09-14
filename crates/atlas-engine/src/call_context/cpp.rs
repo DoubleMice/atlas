@@ -18,9 +18,39 @@ pub(super) fn range(node: Node<'_>) -> TextRange {
 fn at(root: Node<'_>, location: TextRange) -> Option<Node<'_>> {
     root.descendant_for_byte_range(location.start_byte as usize, location.end_byte as usize)
 }
+pub(super) fn expression(root: Node<'_>, location: TextRange) -> Option<Node<'_>> {
+    at(root, location).filter(|node| {
+        node.start_byte() == location.start_byte as usize
+            && node.end_byte() == location.end_byte as usize
+    })
+}
+pub(super) fn record(root: Node<'_>, location: TextRange) -> Option<Node<'_>> {
+    let mut node = at(root, location)?;
+    loop {
+        if matches!(node.kind(), "class_specifier" | "struct_specifier") {
+            // Do not attribute a nested or recovered name to an enclosing type.
+            return node
+                .child_by_field_name("name")
+                .filter(|name| {
+                    name.start_byte() == location.start_byte as usize
+                        && name.end_byte() == location.end_byte as usize
+                })
+                .map(|_| node);
+        }
+        node = node.parent()?;
+    }
+}
 pub(super) fn receiver(root: Node<'_>, location: TextRange) -> Option<Node<'_>> {
     let mut node = at(root, location)?;
     loop {
+        if node.kind() == "field_expression"
+            && node.child_by_field_name("field").is_some_and(|field| {
+                field.start_byte() == location.start_byte as usize
+                    && field.end_byte() == location.end_byte as usize
+            })
+        {
+            return node.child_by_field_name("argument");
+        }
         if node.kind() == "call_expression" {
             let function = node.child_by_field_name("function")?;
             if function.kind() == "field_expression" {
@@ -70,6 +100,12 @@ pub(super) struct BindingSyntax<'a> {
     pub initializer: Option<Node<'a>>,
 }
 pub(super) fn binding(root: Node<'_>, location: TextRange) -> Option<BindingSyntax<'_>> {
+    binding_origin(root, location).filter(|syntax| !syntax.declaration.has_error())
+}
+
+/// Written declaration/initializer extents only. Callers must preserve syntax
+/// diagnostics before using a partially parsed declaration as investigation context.
+pub(super) fn binding_origin(root: Node<'_>, location: TextRange) -> Option<BindingSyntax<'_>> {
     let mut node = at(root, location)?;
     let mut initializer = None;
     loop {
@@ -83,9 +119,6 @@ pub(super) fn binding(root: Node<'_>, location: TextRange) -> Option<BindingSynt
                 | "parameter_declaration"
                 | "optional_parameter_declaration"
         ) {
-            if node.has_error() {
-                return None;
-            }
             return Some(BindingSyntax {
                 declaration: node,
                 type_node: node.child_by_field_name("type"),
@@ -104,16 +137,21 @@ pub(super) fn binding(root: Node<'_>, location: TextRange) -> Option<BindingSynt
 pub(super) struct CallableSyntax<'a> {
     pub header: TextRange,
     pub type_node: Option<Node<'a>>,
+    pub parameters: Option<Node<'a>>,
 }
 pub(super) fn callable(root: Node<'_>, location: TextRange) -> Option<CallableSyntax<'_>> {
     let mut node = at(root, location)?;
     let mut function = false;
+    let mut parameters = None;
     loop {
         if node.kind() == "function_declarator" {
             if node.has_error() {
                 return None;
             }
             function = true;
+            if parameters.is_none() {
+                parameters = node.child_by_field_name("parameters");
+            }
         }
         if matches!(
             node.kind(),
@@ -129,7 +167,11 @@ pub(super) fn callable(root: Node<'_>, location: TextRange) -> Option<CallableSy
                 header.end_column = body.start_position().column as u32;
             }
             let type_node = node.child_by_field_name("type").filter(|n| !n.has_error());
-            return Some(CallableSyntax { header, type_node });
+            return Some(CallableSyntax {
+                header,
+                type_node,
+                parameters,
+            });
         }
         if matches!(
             node.kind(),
@@ -140,14 +182,31 @@ pub(super) fn callable(root: Node<'_>, location: TextRange) -> Option<CallableSy
         node = node.parent()?;
     }
 }
-pub(super) fn type_names(root: Node<'_>) -> Vec<Node<'_>> {
+pub(super) fn type_names<'a>(root: Node<'a>, source: &str) -> Vec<Node<'a>> {
     let mut names = vec![];
     let mut pending = vec![root];
     while let Some(node) = pending.pop() {
         if node.has_error() {
             continue;
         }
-        if node.kind() == "type_identifier" {
+        // The grammar's primitive_type also includes library typedef spellings
+        // such as size_t and fixed-width integers. Only language type keywords
+        // can be omitted from declaration-name investigation on that basis.
+        let named_primitive = node.kind() == "primitive_type"
+            && !matches!(
+                text(node, source),
+                "bool"
+                    | "char"
+                    | "int"
+                    | "float"
+                    | "double"
+                    | "void"
+                    | "wchar_t"
+                    | "char8_t"
+                    | "char16_t"
+                    | "char32_t"
+            );
+        if node.kind() == "type_identifier" || named_primitive {
             names.push(node);
             continue;
         }

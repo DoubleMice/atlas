@@ -15,7 +15,6 @@
 
 (translation_unit
   (function_definition
-    type: (_)
     declarator: (function_declarator
       declarator: (qualified_identifier) @definition.function)
     body: (_)))
@@ -37,10 +36,10 @@
     body: (_)))
 
 (translation_unit
-  (class_specifier (type_identifier) @definition.class))
+  (class_specifier name: [(type_identifier) (qualified_identifier)] @definition.class))
 
 (translation_unit
-  (struct_specifier (type_identifier) @definition.class))
+  (struct_specifier name: [(type_identifier) (qualified_identifier)] @definition.class))
 
 (translation_unit
   (namespace_definition name: (_) @definition.namespace))
@@ -60,4 +59,4 @@
 
 (translation_unit
   (template_declaration
-    (class_specifier (type_identifier) @definition.class)))
+    (class_specifier name: [(type_identifier) (qualified_identifier)] @definition.class)))

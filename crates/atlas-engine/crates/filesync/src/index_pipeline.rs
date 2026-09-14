@@ -20,6 +20,9 @@ use crate::index_pipeline_orchestrator::IndexPipeline;
 use crate::progress::{NoopSink, ProgressSink};
 
 pub(crate) const KEY_FILE_LANGUAGES: &str = "file_language_overrides";
+pub(crate) const KEY_COMPILER_CALL_INPUT: &str = "compiler_call_input_hash";
+/// Located limitations from the explicitly selected compiler call input.
+pub const KEY_COMPILER_CALL_GAPS: &str = "compiler_call_gaps";
 
 /// Options controlling one index pipeline run.
 #[derive(Clone)]
@@ -33,6 +36,9 @@ pub struct IndexPipelineOptions {
     /// Ordered, project-relative C/C++ header search directories. Includes
     /// resolve only against indexed inputs; this does not expand discovery.
     pub include_paths: Vec<PathBuf>,
+    /// Explicit compiler observations, merged before graph construction. Never
+    /// discovered automatically from repository files. None selects source-only.
+    pub compiler_calls: Option<resolution::compiler::CompilerCallInput>,
 }
 
 impl IndexPipelineOptions {
@@ -43,6 +49,7 @@ impl IndexPipelineOptions {
             exclude_patterns: Vec::new(),
             file_languages: BTreeMap::new(),
             include_paths: Vec::new(),
+            compiler_calls: None,
         }
     }
 
@@ -66,6 +73,11 @@ impl IndexPipelineOptions {
 
     pub fn with_include_paths(mut self, include_paths: Vec<PathBuf>) -> Self {
         self.include_paths = include_paths;
+        self
+    }
+
+    pub fn with_compiler_calls(mut self, input: resolution::compiler::CompilerCallInput) -> Self {
+        self.compiler_calls = Some(input);
         self
     }
 }
