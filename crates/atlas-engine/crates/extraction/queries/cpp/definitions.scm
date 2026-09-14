@@ -138,7 +138,6 @@
 
 ;; Preprocessor macro definitions
 (preproc_def (identifier) @definition.macro)
-(preproc_function_def name: (identifier) @definition.macro)
 
 ;; Template declarations
 (template_declaration

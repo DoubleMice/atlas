@@ -7,7 +7,6 @@ members = [
     "crates/atlas-mcp",
 ]
 resolver = "2"
-exclude = ["vendor/tree-sitter-cpp"]
 
 [workspace.package]
 version = "1.7.0"

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 /// Version of the dataflow computation, independent of structural extraction.
 /// Bump when CFG, binding/use-def, value edges, callable ownership or diagnostics change.
-pub const DATAFLOW_ANALYZER_VERSION: u32 = 16;
+pub const DATAFLOW_ANALYZER_VERSION: u32 = 17;
 
 // ---------------------------------------------------------------------------
 // AnalysisUnit
