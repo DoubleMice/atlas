@@ -53,6 +53,19 @@ fn inspect(source: &str, expression: &str) -> (Vec<(String, String)>, Vec<String
 }
 
 #[test]
+fn capture_initializer_conditions_belong_to_creation_and_not_the_body() {
+    let source = "void run(bool enabled, int input) { if (!enabled) return; auto pending = [saved = input + 1] { int body_value = 7; }; }";
+    assert_eq!(
+        inspect(source, "input + 1").0,
+        vec![("control_false_branch".into(), "(!enabled)".into())]
+    );
+    assert!(
+        inspect(source, "7").0.is_empty(),
+        "the closure body does not inherit the creation branch"
+    );
+}
+
+#[test]
 fn early_return_and_nested_branches_preserve_actual_boolean_paths() {
     let source = "int submit(); int denied(); int run(bool allowed) { if (!allowed) { return denied(); } return submit(); }\n";
     let (controls, gaps) = inspect(source, "submit()");

@@ -6,20 +6,15 @@ impl extraction::CancelCheck for Cancellation<'_> {
         (self.0)()
     }
 }
+
 impl Investigation<'_> {
     pub(super) fn function_owner(
         &self,
         at: &ContextLocation,
         parsed: &ParsedSource,
     ) -> anyhow::Result<Option<SymbolDef>> {
-        let syntax = parsed
-            .tree
-            .root_node()
-            .descendant_for_byte_range(at.range.start_byte as usize, at.range.end_byte as usize)
-            .and_then(|node| {
-                std::iter::successors(Some(node), |n| n.parent())
-                    .find(|node| matches!(node.kind(), "function_definition" | "lambda_expression"))
-            });
+        let syntax =
+            extraction::cpp_expressions::expression_function(parsed.tree.root_node(), at.range);
         let parameter = parsed
             .tree
             .root_node()

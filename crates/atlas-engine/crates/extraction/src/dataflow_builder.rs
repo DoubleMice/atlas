@@ -192,6 +192,10 @@ impl DataFlowBuilder {
         // FieldLoad, Assign, and containment edges have correct function_id
         // for scope-aware matching.
         resolve_dataflow_function_ids(&mut nodes, symbols);
+        #[cfg(feature = "cpp")]
+        if ctx.language == types::Language::Cpp {
+            crate::languages::cpp::dataflow::capture_initializer_owners(ctx, symbols, &mut nodes);
+        }
 
         // Post-process: create dataflow edges from AST structure
         build_dataflow_edges(&nodes, bindings, ctx, &node_pos_map, &mut edges);

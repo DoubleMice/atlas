@@ -3,7 +3,7 @@
 //! Provides query-driven extraction for C++ source files.
 
 mod callables;
-mod dataflow;
+pub(crate) mod dataflow;
 pub(crate) mod declarations;
 pub(crate) mod lambdas;
 pub(crate) mod templates;

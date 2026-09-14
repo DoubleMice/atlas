@@ -92,6 +92,11 @@ fn lazy_enclosing_bindings_survive_build_order_and_recomputation() {
             "context.ts",
             "function selected(input: number) { function inner() { { let input=7; input++; } return input; } return 0; } function unrelated(input: number) { return input; }",
         ),
+        (
+            Language::Cpp,
+            "initializers.cpp",
+            "int selected(int input) { auto inner = [saved = input + 1] { return saved; }; return 0; } int unrelated(int input) { return input; }",
+        ),
     ] {
         for inner_first in [true, false] {
             let dir = tempfile::tempdir().unwrap();

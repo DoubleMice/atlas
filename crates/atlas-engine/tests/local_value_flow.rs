@@ -54,6 +54,133 @@ fn run(
 }
 
 #[test]
+fn capture_initializer_values_use_the_enclosing_scope() {
+    for source in [
+        "void outer(int input) { auto pending = [saved = input + 1] {}; }",
+        "void outer(int input) { auto pending = [saved = (input + 1)] {}; }",
+        "void outer(int input) { auto pending = [&saved = input] {}; }",
+        "void outer(int input) { auto pending = [nested = [saved = input + 1] {}] {}; }",
+    ] {
+        let selected = if source.contains("(input + 1)") {
+            "(input + 1)"
+        } else if source.contains("input + 1") {
+            "input + 1"
+        } else {
+            "input"
+        };
+        let result = run(source, selected, 30);
+        assert_eq!(result.scopes.len(), 1, "{source}: {result:#?}");
+        assert_eq!(result.scopes[0].range.start_byte, 0, "{result:#?}");
+        assert!(
+            result.paths.iter().all(|path| {
+                path.sink.location.range.start_byte as usize == source.rfind(selected).unwrap()
+                    && path.sink.location.range.byte_len() as usize == selected.len()
+            }),
+            "the selected RHS must not fall back to the enclosing closure expression: {result:#?}"
+        );
+        assert!(
+            result
+                .paths
+                .iter()
+                .any(|path| path.endpoint.kind == "parameter"
+                    && path.endpoint.name.as_deref() == Some("input")),
+            "{source}: {result:#?}"
+        );
+        assert!(
+            !result
+                .gaps
+                .iter()
+                .any(|gap| gap.1 == "value_scope_unavailable"),
+            "{result:#?}"
+        );
+    }
+}
+
+#[test]
+fn capture_initializer_fields_keep_contents_separate_from_receivers() {
+    let source = "struct Permissions { bool allowed; }; void outer(Permissions permissions) { auto pending = [allowed = permissions.allowed] {}; }";
+    let result = run(source, "permissions.allowed", 30);
+    assert_eq!(result.scopes.len(), 1, "{result:#?}");
+    assert!(
+        result
+            .paths
+            .iter()
+            .all(|path| path.sink.location.range.byte_len() == 19),
+        "{result:#?}"
+    );
+    assert!(
+        result
+            .paths
+            .iter()
+            .any(|path| path.endpoint.kind == "field"),
+        "{result:#?}"
+    );
+    assert!(
+        result
+            .paths
+            .iter()
+            .all(|path| path.endpoint.kind != "parameter"),
+        "a receiver is not the stored value: {result:#?}"
+    );
+    assert!(
+        result
+            .gaps
+            .iter()
+            .any(|gap| gap.1 == "value_field_contents_unestablished" && !gap.3.is_empty()),
+        "{result:#?}"
+    );
+}
+
+#[test]
+fn capture_initializers_do_not_borrow_body_or_global_execution_contexts() {
+    let body = run(
+        "void outer(int input) { auto pending = [saved = input] { return saved; }; }",
+        "saved",
+        30,
+    );
+    assert_eq!(body.scopes.len(), 1, "{body:#?}");
+    assert_ne!(body.scopes[0].range.start_byte, 0, "{body:#?}");
+    assert!(
+        body.paths
+            .iter()
+            .all(|path| path.endpoint.name.as_deref() != Some("input")),
+        "creation is not invocation: {body:#?}"
+    );
+    for (source, selected) in [
+        (
+            "void outer(int input) { auto pending = [saved = input] {}; }",
+            "saved",
+        ),
+        ("auto pending = [saved = 7] {};", "7"),
+    ] {
+        let result = run(source, selected, 30);
+        assert!(
+            result.scopes.is_empty() && result.paths.is_empty(),
+            "{source}: {result:#?}"
+        );
+        assert!(
+            result
+                .gaps
+                .iter()
+                .any(|gap| gap.1 == "value_scope_unavailable"),
+            "{result:#?}"
+        );
+    }
+    let nested = "void outer(int input) { auto pending = [](int local) { auto inner = [saved = local + 1] {}; }; }";
+    let result = run(nested, "local + 1", 30);
+    assert_eq!(result.scopes.len(), 1, "{result:#?}");
+    assert_ne!(result.scopes[0].range.start_byte, 0, "{result:#?}");
+    assert!(
+        result
+            .paths
+            .iter()
+            .any(|path| path.endpoint.kind == "parameter"
+                && path.endpoint.name.as_deref() == Some("local")),
+        "{result:#?}"
+    );
+}
+
+#[test]
 fn local_parameters_assignments_and_returns_have_readable_dependency_paths() {
     let result = run(
         "int pass(int input) { int value = input; return value; }",

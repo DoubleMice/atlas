@@ -32,6 +32,11 @@
   declarator: (identifier) @df.assign_target
   value: (_) @df.assign_value)
 
+;; Init-capture RHS is a value in the enclosing evaluation scope. This does not
+;; bind the stored capture or any subsequent invocation of the closure body.
+(lambda_capture_initializer
+  right: (_) @df.assign_value)
+
 ;; --- Return statements ---
 (return_statement
   (_) @df.return_value)

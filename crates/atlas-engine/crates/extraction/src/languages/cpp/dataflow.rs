@@ -6,6 +6,38 @@ use types::{DataFlowEdge, DataFlowEdgeId, DataFlowKind, DataNode, DataNodeId, Da
 
 use crate::{dataflow_builder::NodePosKey, extraction_ctx::ExtractionCtx};
 
+/// Correct only data nodes inside recorded capture lists, before constructing
+/// function-local edges. Body nodes and other language ownership stay intact.
+pub(crate) fn capture_initializer_owners(
+    ctx: &ExtractionCtx<'_>,
+    symbols: &[types::SymbolDef],
+    nodes: &mut [DataNode],
+) {
+    let initializers = super::lambdas::caller_initializers(ctx.root, symbols);
+    for node in nodes {
+        let Some(range) = node.function_id.and_then(|id| initializers.get(&id)) else {
+            continue;
+        };
+        if range.start_byte > node.range.start_byte || node.range.end_byte > range.end_byte {
+            continue;
+        }
+        let owner = crate::cpp_expressions::expression_function(ctx.root, node.range);
+        node.function_id = owner.and_then(|owner| {
+            let mut matched = symbols.iter().filter(|symbol| {
+                matches!(
+                    symbol.kind,
+                    types::SymbolKind::Function
+                        | types::SymbolKind::Method
+                        | types::SymbolKind::Constructor
+                ) && symbol.range.start_byte == owner.start_byte() as u32
+                    && symbol.range.end_byte == owner.end_byte() as u32
+            });
+            let selected = matched.next()?;
+            matched.next().is_none().then_some(selected.id)
+        });
+    }
+}
+
 pub(super) fn field_receivers(
     ctx: &ExtractionCtx<'_>,
     positions: &HashMap<NodePosKey, DataNodeId>,
