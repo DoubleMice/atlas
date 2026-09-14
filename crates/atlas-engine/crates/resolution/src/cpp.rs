@@ -374,9 +374,9 @@ impl TypeIndex {
         self.files.get(file)?.callables.get(*position)
     }
 
-    /// Check a body already selected by source resolution against an exact
-    /// compiler-selected declaration. This does not search for another body or
-    /// establish overload applicability; the two producers supply those facts.
+    /// Check a source body against a selected declaration using the existing
+    /// identity, parameter, qualifier and visibility rules. This does not select
+    /// a call overload or prove that the matching body is unique.
     pub(crate) fn matches_selected_declaration(
         &self,
         declaration: &SymbolDef,

@@ -397,6 +397,139 @@ fn a_compiler_selected_overload_does_not_inherit_another_overloads_body() {
     assert_ne!(source[0].1.symbol_id, wrong.id);
 }
 
+#[test]
+fn compiler_declaration_uses_the_existing_unique_body_association_without_a_source_call() {
+    let header = "template<class T> struct Handle {}; struct Api { struct Item {}; Handle<Item> read(); }; Api* acquire();\n";
+    let body = "#include \"api.hpp\"\nHandle<Api::Item> Api::read() { return {}; }\n";
+    let caller = "#include \"api.hpp\"\nauto selected() { return acquire()->read(); }\n";
+    let (root, store, input) = declared_body_case(header, body, caller);
+    run(&store, root.path(), None);
+    let reference = store
+        .get_all_call_references()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.file_id == types::FileId::generate("sample.cpp") && r.name == "read")
+        .unwrap();
+    assert!(reference.resolved.is_none(), "{reference:?}");
+    let navigation = atlas_engine::cpp_declaration_navigation(&store, &|| false).unwrap();
+    let member = navigation
+        .iter()
+        .find(|r| r.declaration.qualified_name == "Api")
+        .unwrap()
+        .members
+        .iter()
+        .find(|m| m.declaration.name == "read")
+        .unwrap();
+    assert_eq!(member.definitions.len(), 1);
+    let expected = member.definitions[0].id;
+    run(&store, root.path(), Some(input.clone()));
+    let selected = store
+        .get_reference_by_id(reference.id.as_bytes())
+        .unwrap()
+        .unwrap()
+        .resolved
+        .unwrap();
+    assert_eq!(selected.symbol_id, expected);
+    assert_eq!(selected.provenance, Provenance::Compiler);
+    assert_eq!(selected.strategy, ResolutionStrategy::Compiler);
+    assert!(
+        gaps(&store)
+            .iter()
+            .any(|g| g.reason == CompilerBindingGapReason::DefinitionUnavailable)
+    );
+    let before = calls(&store);
+    let repeat = run(&store, root.path(), Some(input));
+    assert_eq!(repeat.edges_built, 0);
+    assert_eq!(calls(&store), before);
+}
+
+fn declared_body_case(
+    header: &str,
+    body: &str,
+    caller: &str,
+) -> (tempfile::TempDir, Arc<Store>, CompilerCallInput) {
+    let root = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open_in_memory().unwrap());
+    store.init_schema().unwrap();
+    let mut inputs = BTreeMap::new();
+    for (path, text) in [
+        ("api.hpp", header),
+        ("body.cpp", body),
+        ("sample.cpp", caller),
+    ] {
+        std::fs::write(root.path().join(path), text).unwrap();
+        inputs.insert(
+            path.into(),
+            blake3::hash(text.as_bytes()).to_hex().to_string(),
+        );
+    }
+    let mut declaration = location(header, "read");
+    declaration.path = "api.hpp".into();
+    let mut at = location(caller, "read()");
+    at.end_byte = at.start_byte + 4;
+    let input = CompilerCallInput {
+        inputs,
+        observations: vec![CompilerObservation {
+            kind: CompilerObservationKind::CallDeclaration,
+            location: at,
+            call_expression: Some(location(caller, "acquire()->read()")),
+            declaration: CompilerDeclaration {
+                name: "read".into(),
+                location: declaration,
+            },
+            definition: None,
+            owner: Some(CompilerDeclaration {
+                name: "selected".into(),
+                location: location(caller, "selected"),
+            }),
+            dispatch: CompilerDispatch::Direct,
+        }],
+    };
+    (root, store, input)
+}
+
+#[test]
+fn compiler_declaration_body_composition_keeps_ambiguity_and_unsupported_signatures() {
+    let header = "struct Api { int read(); }; Api* acquire();\n";
+    let caller = "#include \"api.hpp\"\nint selected() { return acquire()->read(); }\n";
+    for body in [
+        "#include \"api.hpp\"\nint Api::read(int value) { return value; }\n",
+        "#include \"api.hpp\"\nint Api::read() const { return 1; }\n",
+        "namespace other { struct Api { int read() { return 1; } }; }\n",
+        "#include \"api.hpp\"\ntemplate<class T> int Api::read() { return 1; }\n",
+    ] {
+        let (root, store, input) = declared_body_case(header, body, caller);
+        run(&store, root.path(), Some(input));
+        let reference = store
+            .get_all_call_references()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.file_id == types::FileId::generate("sample.cpp") && r.name == "read")
+            .unwrap();
+        let target = store
+            .find_symbol_by_id(&reference.resolved.unwrap().symbol_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(target.range, target.name_range, "{body}: {target:?}");
+        assert_eq!(target.file_id, types::FileId::generate("api.hpp"));
+    }
+    let body = "#include \"api.hpp\"\nint Api::read() { return 1; }\n";
+    let (root, store, input) = declared_body_case(header, body, caller);
+    std::fs::write(root.path().join("alternative.cpp"), body).unwrap();
+    run(&store, root.path(), Some(input));
+    let reference = store
+        .get_all_call_references()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.file_id == types::FileId::generate("sample.cpp") && r.name == "read")
+        .unwrap();
+    let target = store
+        .find_symbol_by_id(&reference.resolved.unwrap().symbol_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(target.range, target.name_range, "{target:?}");
+}
+
 struct StopAtResolution(AtomicBool);
 impl ProgressSink for StopAtResolution {
     fn emit(&self, event: ProgressEvent) {

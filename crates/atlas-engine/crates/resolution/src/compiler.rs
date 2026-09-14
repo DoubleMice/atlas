@@ -12,7 +12,7 @@ use std::path::{Component, Path};
 use db::Store;
 use serde::{Deserialize, Serialize};
 use types::{
-    CallsiteId, Confidence, FileId, Provenance, ReferenceId, ReferenceKind, ReferenceUse,
+    CallsiteId, Confidence, FileId, Language, Provenance, ReferenceId, ReferenceKind, ReferenceUse,
     ResolutionStrategy, ResolvedTarget, SymbolDef, SymbolId, SymbolKind,
 };
 
@@ -450,6 +450,55 @@ pub fn apply_compiler_call_bindings(
             .is_some_and(|types| types.matches_selected_declaration(&declaration, &body))
         {
             preserved.insert(reference.id, target.clone());
+        }
+    }
+    // Call selection and declaration/body association are separate facts. A
+    // source resolver may lack the receiver or argument facts needed to select
+    // this call, while still associating the compiler-selected declaration with
+    // one body. Reuse the same typed rule as declaration navigation; names alone
+    // never suffice, and multiple matching bodies retain the declaration.
+    let mut bodies: HashMap<SymbolId, Option<SymbolId>> = HashMap::new();
+    for binding in &bindings.resolved {
+        if preserved.contains_key(&binding.reference.id) {
+            continue;
+        }
+        let Some(declaration) = store.find_symbol_by_id(&binding.target.symbol_id)? else {
+            continue;
+        };
+        if declaration.language != Language::Cpp || declaration.range != declaration.name_range {
+            continue;
+        }
+        let body = if let Some(found) = bodies.get(&declaration.id) {
+            *found
+        } else {
+            if types.is_none() {
+                types = Some(crate::cpp::TypeIndex::build(store)?);
+            }
+            let mut definitions = store
+                .find_symbols_by_qname(&declaration.qualified_name)?
+                .into_iter()
+                .filter(|body| {
+                    types
+                        .as_ref()
+                        .unwrap()
+                        .matches_selected_declaration(&declaration, body)
+                });
+            let first = definitions.next();
+            let unique = if definitions.next().is_none() {
+                first.map(|body| body.id)
+            } else {
+                None
+            };
+            bodies.insert(declaration.id, unique);
+            unique
+        };
+        if let Some(body) = body {
+            // Compiler provenance describes call selection. Its missing-body
+            // observation remains a producer limit; the body association above
+            // comes from supported source declarations, not the compiler AST.
+            let mut target = binding.target.clone();
+            target.symbol_id = body;
+            preserved.insert(binding.reference.id, target);
         }
     }
     let affected: HashSet<_> = bindings
