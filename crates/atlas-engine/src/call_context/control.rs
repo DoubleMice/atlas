@@ -1,5 +1,5 @@
-//! Boolean conditions over the selected function's recorded CFG. No permission
-//! interpretation, runtime feasibility decision or persistent graph mutation.
+//! Boolean conditions from the selected function's CFG and C++ operand guards.
+//! No permission interpretation, feasibility decision or persistent graph mutation.
 use super::*;
 use analysis::cfg_graph::CfgGraph;
 use std::collections::HashSet;
@@ -77,6 +77,48 @@ impl Investigation<'_> {
         let mut transfers = Vec::new();
         let mut conditional_operands = Vec::new();
         if let Some(function) = syntax {
+            // Operand selection is a language fact, independent of whether the
+            // statement CFG lowers this expression. Follow only the selected
+            // expression's ancestry within its established evaluation scope;
+            // an init-capture RHS belongs to creation, a closure body does not.
+            let selected = parsed
+                .tree
+                .root_node()
+                .descendant_for_byte_range(start as usize, end as usize);
+            for node in std::iter::successors(selected, |node| node.parent())
+                .take_while(|node| *node != function)
+            {
+                self.check()?;
+                if node.kind() != "conditional_expression" {
+                    continue;
+                }
+                let (Some(condition), Some(consequence), Some(alternative)) = (
+                    node.child_by_field_name("condition"),
+                    node.child_by_field_name("consequence"),
+                    node.child_by_field_name("alternative"),
+                ) else {
+                    continue;
+                };
+                let selected_operand = [consequence, alternative].iter().position(|operand| {
+                    operand.start_byte() <= start as usize && end as usize <= operand.end_byte()
+                });
+                if let Some(operand) = selected_operand {
+                    let supported = !node.has_error()
+                        && !node.is_missing()
+                        && selected.is_some_and(|selected| {
+                            extraction::cpp_expressions::may_be_evaluated(selected, &parsed.source)
+                        });
+                    conditional_operands.push((
+                        cpp::range(node),
+                        [condition, consequence, alternative].map(cpp::range),
+                        supported.then_some(if operand == 0 {
+                            "control_true_branch"
+                        } else {
+                            "control_false_branch"
+                        }),
+                    ));
+                }
+            }
             let mut pending = vec![function];
             while let Some(node) = pending.pop() {
                 self.check()?;
@@ -87,21 +129,6 @@ impl Investigation<'_> {
                 }
                 if node.kind() == "goto_statement" {
                     transfers.push(cpp::range(node));
-                }
-                if node.kind() == "conditional_expression"
-                    && let (Some(condition), Some(consequence), Some(alternative)) = (
-                        node.child_by_field_name("condition"),
-                        node.child_by_field_name("consequence"),
-                        node.child_by_field_name("alternative"),
-                    )
-                    && [consequence, alternative].iter().any(|operand| {
-                        operand.start_byte() <= start as usize && end as usize <= operand.end_byte()
-                    })
-                {
-                    conditional_operands.push((
-                        cpp::range(node),
-                        [condition, consequence, alternative].map(cpp::range),
-                    ));
                 }
                 if matches!(node.kind(), "preproc_if" | "preproc_ifdef") {
                     let range = cpp::range(node);
@@ -138,15 +165,20 @@ impl Investigation<'_> {
             .into_iter()
             .filter(|n| n.function_id == owner.id)
             .collect();
-        for (range, operands) in conditional_operands {
+        let mut operand_guards = Vec::new();
+        for (range, operands, role) in conditional_operands {
             if !nodes
                 .iter()
                 .any(|node| node.kind == CfgNodeKind::Branch && node.stmt_range == range)
             {
+                if let Some(role) = role {
+                    operand_guards.push((range, operands[0], role));
+                    continue;
+                }
                 self.control_gap(
                     &subject,
                     "control_expression_unestablished",
-                    "The selection is inside an operand of a conditional expression whose choice is not represented in the recorded CFG. Read the condition and both operands at the related locations. Other recorded conditions do not establish which operand executes.",
+                    "The conditional operand guard is not established for this syntax or evaluation context. Read the condition and both operands at the related locations. Other recorded conditions do not establish which operand executes.",
                     operands.into_iter().map(|range| ContextLocation { file_id, range }).collect(),
                 )?;
             }
@@ -325,6 +357,17 @@ impl Investigation<'_> {
                 message: "Every recorded CFG path from function entry to this selection traverses this boolean branch edge. This is a path observation, not the condition's current value or a runtime permission decision.".into(),
             });
         }
-        self.control_gap(&subject, "control_flow_limited", "Conditions describe the recorded CFG of this function only. Unsupported or omitted flow, callee effects, exceptions, runtime feasibility and caller permissions remain unestablished; no conditions does not mean unrestricted execution.", vec![scope])
+        for (expression, condition, role) in operand_guards {
+            self.check()?;
+            self.reserve_item()?;
+            self.result.items.push(CallContextItem {
+                subject: subject.clone(), role,
+                location: ContextLocation { file_id, range: condition },
+                symbol_id: None,
+                related_locations: vec![scope.clone(), ContextLocation { file_id, range: expression }],
+                message: "Evaluating this selected operand of a C++ conditional expression requires the indicated condition outcome. This source rule does not establish the condition's value, operand execution or a runtime permission decision.".into(),
+            });
+        }
+        self.control_gap(&subject, "control_flow_limited", "Conditions describe this function's recorded CFG and supported source operand guards. Unsupported or omitted flow, callee effects, exceptions, runtime feasibility and caller permissions remain unestablished; no conditions does not mean unrestricted execution.", vec![scope])
     }
 }

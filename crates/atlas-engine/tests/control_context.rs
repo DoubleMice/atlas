@@ -104,7 +104,65 @@ fn rejoining_and_bypass_paths_cannot_be_misreported_as_guards() {
 }
 
 #[test]
-fn conditional_operand_limits_preserve_independent_guards_and_scope() {
+fn conditional_operands_have_source_guards_without_asserting_the_condition_value() {
+    let source = "int left(); int right(); int run(bool allowed, bool choose) { if (!allowed) return 0; int value = choose ? left() : right(); return value; }";
+    for (selected, role) in [
+        ("left()", "control_true_branch"),
+        ("right()", "control_false_branch"),
+    ] {
+        let (conditions, gaps) = inspect(source, selected);
+        assert_eq!(
+            conditions,
+            vec![
+                ("control_false_branch".into(), "(!allowed)".into()),
+                (role.into(), "choose".into())
+            ]
+        );
+        assert!(!gaps.contains(&"control_expression_unestablished".into()));
+    }
+    for selected in ["choose ?", "choose ? left() : right()", "return value;"] {
+        assert_eq!(
+            inspect(source, selected).0,
+            vec![("control_false_branch".into(), "(!allowed)".into())]
+        );
+    }
+    let nested = "int left(); int right(); int run(bool outer, bool inner) { return outer ? (inner ? left() : right()) : 0; }";
+    let mut conditions = inspect(nested, "right()").0;
+    conditions.sort();
+    assert_eq!(
+        conditions,
+        vec![
+            ("control_false_branch".into(), "inner".into()),
+            ("control_true_branch".into(), "outer".into())
+        ]
+    );
+}
+
+#[test]
+fn conditional_guards_respect_evaluation_scope_and_syntax_recovery() {
+    for expression in [
+        "sizeof(choose ? left() : right())",
+        "noexcept(choose ? left() : right())",
+        "requires { choose ? left() : right(); }",
+    ] {
+        let source = format!(
+            "int left(); int right(); void run(bool choose) {{ auto value = {expression}; }}"
+        );
+        assert!(inspect(&source, "left()").0.is_empty(), "{source}");
+    }
+    let source = "int left(); int right(); void run(bool choose) { auto pending = [saved = choose ? left() : right()] { return 7; }; }";
+    assert_eq!(
+        inspect(source, "left()").0,
+        vec![("control_true_branch".into(), "choose".into())]
+    );
+    assert!(inspect(source, "7").0.is_empty());
+    let recovered =
+        "int left(); int right(); int run(bool choose) { return (choose + ) ? left() : right(); }";
+    assert!(inspect(recovered, "left()").0.is_empty());
+}
+
+#[test]
+fn conditional_operand_guards_preserve_independent_guards_and_scope() {
     for expression in [
         "choose ? left() : right()",
         "(choose ? (left()) : (right()))",
@@ -116,9 +174,20 @@ fn conditional_operand_limits_preserve_independent_guards_and_scope() {
             let (conditions, gaps) = inspect(&source, selected);
             assert_eq!(
                 conditions,
-                vec![("control_false_branch".into(), "(!allowed)".into())]
+                vec![
+                    ("control_false_branch".into(), "(!allowed)".into()),
+                    (
+                        if selected == "left()" {
+                            "control_true_branch"
+                        } else {
+                            "control_false_branch"
+                        }
+                        .into(),
+                        "choose".into()
+                    )
+                ]
             );
-            assert!(gaps.contains(&"control_expression_unestablished".into()));
+            assert!(!gaps.contains(&"control_expression_unestablished".into()));
         }
         for selected in ["choose ?", "return value;"] {
             assert!(
