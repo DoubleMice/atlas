@@ -10,10 +10,17 @@ use std::{collections::BTreeMap, path::Path, sync::Arc};
 
 const SOURCE: &str = "struct Target { int read() { return 1; } int read(int) { return 2; } }; int selected(Target& object) { return object.read(); } int other() { return 0; }";
 
-fn declaration(source: &str, expression: &str, name: &str) -> CompilerDeclaration {
+fn declaration(source: &str, expression: &str, qualified_name: &str) -> CompilerDeclaration {
+    let name = qualified_name.rsplit("::").next().unwrap();
     let start = source.find(expression).unwrap() + expression.find(name).unwrap();
     CompilerDeclaration {
         name: name.into(),
+        kind: if qualified_name.contains("::") {
+            atlas_engine::SymbolKind::Method
+        } else {
+            atlas_engine::SymbolKind::Function
+        },
+        qualified_name: qualified_name.into(),
         location: CompilerLocation {
             path: "sample.cpp".into(),
             start_byte: start as u32,
@@ -36,7 +43,7 @@ fn case() -> (Arc<Store>, BTreeMap<String, String>, CompilerObservation) {
     let store = Arc::new(Store::open_in_memory().unwrap());
     store.init_schema().unwrap();
     store.insert_file_facts(&facts).unwrap();
-    let target = declaration(SOURCE, "read() {", "read");
+    let target = declaration(SOURCE, "read() {", "Target::read");
     let observation = CompilerObservation {
         kind: CompilerObservationKind::CallDeclaration,
         location: declaration(SOURCE, "object.read()", "read").location,
@@ -82,7 +89,7 @@ fn virtual_case() -> (Store, BTreeMap<String, String>, CompilerObservation) {
             start_byte: start,
             end_byte: start + written.len() as u32,
         }),
-        declaration: declaration(source, "run() = 0", "run"),
+        declaration: declaration(source, "run() = 0", "Base::run"),
         definition: None,
         owner: Some(declaration(source, "entry(Base", "entry")),
         dispatch: CompilerDispatch::Virtual,
@@ -113,13 +120,17 @@ fn virtual_declarations_remain_navigable_without_selecting_an_override() {
             .unwrap();
         selected.definition = Some(CompilerDeclaration {
             name: body.name,
+            kind: body.kind,
+            qualified_name: body.qualified_name,
             location: CompilerLocation {
                 path: "sample.cpp".into(),
                 start_byte: body.name_range.start_byte,
                 end_byte: body.name_range.end_byte,
             },
         });
-        let report = associate_compiler_calls(&store, &[selected], &inputs, &mut || false).unwrap();
+        let report =
+            associate_compiler_calls(&store, &[selected], &inputs, Path::new("."), &mut || false)
+                .unwrap();
         assert!(report.resolved.is_empty());
         assert_eq!(report.gaps.len(), 1);
         let gap = &report.gaps[0];
@@ -159,7 +170,9 @@ fn indexed_virtual_declaration_binding_needs_matching_invocation_and_declaration
                 inputs.insert("sample.cpp".into(), "changed".into());
             }
         }
-        let report = associate_compiler_calls(&store, &[selected], &inputs, &mut || false).unwrap();
+        let report =
+            associate_compiler_calls(&store, &[selected], &inputs, Path::new("."), &mut || false)
+                .unwrap();
         assert!(report.resolved.is_empty());
         assert!(!report.gaps.is_empty());
         assert!(report.gaps.iter().all(|gap| gap.declaration_id.is_none()));
@@ -181,8 +194,14 @@ fn conflicting_virtual_observations_keep_separate_declaration_clues() {
         .unwrap();
     second.declaration.location.start_byte = alternative.name_range.start_byte;
     second.declaration.location.end_byte = alternative.name_range.end_byte;
-    let report =
-        associate_compiler_calls(&store, &[first, second], &inputs, &mut || false).unwrap();
+    let report = associate_compiler_calls(
+        &store,
+        &[first, second],
+        &inputs,
+        Path::new("."),
+        &mut || false,
+    )
+    .unwrap();
     assert!(report.resolved.is_empty());
     assert_eq!(report.gaps.len(), 2);
     assert!(
@@ -216,12 +235,15 @@ fn assert_declaration_source(dispatch: CompilerDispatch, written: &str) {
         "#define MEMBER(name) virtual int name() = 0;\nstruct Base {{ MEMBER(run) }};\nint entry(Base& value) {{ return {written}; }}\n"
     );
     let source = formatted.as_str();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("sample.cpp"), source).unwrap();
+    let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
     let facts = extract_file_with_mode(
         &create_frontend(Language::Cpp).unwrap(),
         FileId::generate("sample.cpp"),
         Path::new("sample.cpp"),
         source,
-        "macro-input",
+        &hash,
         ExtractionMode::Structural,
         &(),
     )
@@ -250,12 +272,14 @@ fn assert_declaration_source(dispatch: CompilerDispatch, written: &str) {
         }),
         declaration: CompilerDeclaration {
             name: "run".into(),
+            kind: atlas_engine::SymbolKind::Method,
+            qualified_name: "Base::run".into(),
             location: location.clone(),
         },
         definition: None,
         owner: Some(declaration(source, "entry(Base", "entry")),
     };
-    let inputs = BTreeMap::from([("sample.cpp".into(), "macro-input".into())]);
+    let inputs = BTreeMap::from([("sample.cpp".into(), hash)]);
     for (call_available, owner_available) in [(true, true), (false, true), (true, false)] {
         let mut observation = observation.clone();
         if !call_available {
@@ -265,8 +289,19 @@ fn assert_declaration_source(dispatch: CompilerDispatch, written: &str) {
             observation.owner = None;
         }
         let report =
-            associate_compiler_calls(&store, &[observation], &inputs, &mut || false).unwrap();
-        assert!(report.resolved.is_empty());
+            associate_compiler_calls(&store, &[observation], &inputs, root.path(), &mut || false)
+                .unwrap();
+        let admitted = call_available && owner_available && dispatch == CompilerDispatch::Direct;
+        assert_eq!(report.resolved.len(), usize::from(admitted));
+        assert_eq!(report.declarations.len(), usize::from(admitted));
+        if admitted {
+            let endpoint = &report.declarations[0];
+            assert_eq!(endpoint.range, endpoint.name_range);
+            assert_eq!(endpoint.qualified_name, "Base::run");
+            assert_eq!(endpoint.kind, atlas_engine::SymbolKind::Method);
+            assert_eq!(endpoint.id, report.resolved[0].target.symbol_id);
+            assert!(store.find_symbol_by_id(&endpoint.id).unwrap().is_none());
+        }
         assert_eq!(report.gaps.len(), 1);
         let gap = &report.gaps[0];
         assert_eq!(
@@ -278,7 +313,7 @@ fn assert_declaration_source(dispatch: CompilerDispatch, written: &str) {
             } else if !owner_available {
                 Gap::OwnerUnavailable
             } else {
-                Gap::SymbolNotUnique
+                Gap::DefinitionUnavailable
             }
         );
         assert_eq!(gap.reference_id.is_some(), call_available);
@@ -299,10 +334,49 @@ fn assert_declaration_source(dispatch: CompilerDispatch, written: &str) {
             }
         }
         let report =
-            associate_compiler_calls(&store, &[observation], &inputs, &mut || false).unwrap();
+            associate_compiler_calls(&store, &[observation], &inputs, root.path(), &mut || false)
+                .unwrap();
         assert!(report.resolved.is_empty());
         assert!(!report.gaps.is_empty());
         assert!(report.gaps.iter().all(|g| g.declaration_location.is_none()));
+    }
+    if dispatch == CompilerDispatch::Direct {
+        for change in 0..5 {
+            let mut invalid = observation.clone();
+            let reason = match change {
+                0 => {
+                    invalid.declaration.kind = atlas_engine::SymbolKind::Field;
+                    Gap::ReferenceMismatch
+                }
+                1 => {
+                    invalid.declaration.qualified_name.clear();
+                    Gap::SymbolNotUnique
+                }
+                2 => {
+                    invalid.declaration.qualified_name = "Base::other".into();
+                    Gap::SymbolNotUnique
+                }
+                3 => {
+                    invalid.declaration.name = "other".into();
+                    invalid.declaration.qualified_name = "Base::other".into();
+                    Gap::InvalidLocation
+                }
+                _ => {
+                    std::fs::write(
+                        root.path().join("sample.cpp"),
+                        source.replace("MEMBER(run)", "MEMBER(fly)"),
+                    )
+                    .unwrap();
+                    Gap::IndexedInputMismatch
+                }
+            };
+            let report =
+                associate_compiler_calls(&store, &[invalid], &inputs, root.path(), &mut || false)
+                    .unwrap();
+            assert!(report.resolved.is_empty());
+            assert!(report.declarations.is_empty());
+            assert_eq!(report.gaps[0].reason, reason);
+        }
     }
     assert!(store.get_all_edges().unwrap().is_empty());
 }
@@ -315,6 +389,7 @@ fn direct_calls_reuse_indexed_identity_and_existing_graph_builder() {
         &store,
         &[observation.clone(), observation],
         &inputs,
+        Path::new("."),
         &mut || false,
     )
     .unwrap();
@@ -365,7 +440,7 @@ fn qualified_callee_spans_match_by_the_complete_invocation() {
     let store = Store::open_in_memory().unwrap();
     store.init_schema().unwrap();
     store.insert_file_facts(&facts).unwrap();
-    let target = declaration(source, "read() {", "read");
+    let target = declaration(source, "read() {", "Parent::read");
     let mut observation = CompilerObservation {
         kind: CompilerObservationKind::CallDeclaration,
         location: declaration(source, written, "read").location,
@@ -381,8 +456,14 @@ fn qualified_callee_spans_match_by_the_complete_invocation() {
         dispatch: CompilerDispatch::Direct,
     };
     let inputs = BTreeMap::from([("sample.cpp".into(), "compiler-input".into())]);
-    let report =
-        associate_compiler_calls(&store, &[observation.clone()], &inputs, &mut || false).unwrap();
+    let report = associate_compiler_calls(
+        &store,
+        &[observation.clone()],
+        &inputs,
+        Path::new("."),
+        &mut || false,
+    )
+    .unwrap();
     assert_eq!(report.resolved.len(), 1, "{:?}", report.gaps);
     let callsite = store
         .find_callsite_by_reference_id(&report.resolved[0].reference.id)
@@ -393,12 +474,22 @@ fn qualified_callee_spans_match_by_the_complete_invocation() {
         source.find(written).unwrap() as u32
     );
     observation.call_expression.as_mut().unwrap().end_byte += 1;
-    let report =
-        associate_compiler_calls(&store, &[observation.clone()], &inputs, &mut || false).unwrap();
+    let report = associate_compiler_calls(
+        &store,
+        &[observation.clone()],
+        &inputs,
+        Path::new("."),
+        &mut || false,
+    )
+    .unwrap();
     assert!(report.resolved.is_empty());
     assert_eq!(report.gaps[0].reason, Gap::CallsiteNotUnique);
     observation.call_expression = None;
-    let report = associate_compiler_calls(&store, &[observation], &inputs, &mut || false).unwrap();
+    let report =
+        associate_compiler_calls(&store, &[observation], &inputs, Path::new("."), &mut || {
+            false
+        })
+        .unwrap();
     assert_eq!(report.gaps[0].reason, Gap::CallExpressionUnavailable);
 }
 
@@ -406,23 +497,37 @@ fn qualified_callee_spans_match_by_the_complete_invocation() {
 fn missing_or_changed_inputs_and_inexact_positions_cannot_borrow_symbols() {
     let (store, mut inputs, observation) = case();
     inputs.insert("sample.cpp".into(), "changed".into());
-    let report =
-        associate_compiler_calls(&store, &[observation.clone()], &inputs, &mut || false).unwrap();
+    let report = associate_compiler_calls(
+        &store,
+        &[observation.clone()],
+        &inputs,
+        Path::new("."),
+        &mut || false,
+    )
+    .unwrap();
     assert!(report.resolved.is_empty());
     assert_eq!(report.gaps[0].reason, Gap::IndexedInputMismatch);
     inputs.clear();
-    let report =
-        associate_compiler_calls(&store, &[observation.clone()], &inputs, &mut || false).unwrap();
+    let report = associate_compiler_calls(
+        &store,
+        &[observation.clone()],
+        &inputs,
+        Path::new("."),
+        &mut || false,
+    )
+    .unwrap();
     assert_eq!(report.gaps[0].reason, Gap::InputIdentityUnavailable);
     inputs.insert("sample.cpp".into(), "compiler-input".into());
     let mut wrong = observation.clone();
     wrong.definition.as_mut().unwrap().location.start_byte += 1;
-    let report = associate_compiler_calls(&store, &[wrong], &inputs, &mut || false).unwrap();
+    let report =
+        associate_compiler_calls(&store, &[wrong], &inputs, Path::new("."), &mut || false).unwrap();
     assert!(report.resolved.is_empty());
     assert_eq!(report.gaps[0].reason, Gap::SymbolNotUnique);
     let mut wrong = observation;
     wrong.location.start_byte -= 1;
-    let report = associate_compiler_calls(&store, &[wrong], &inputs, &mut || false).unwrap();
+    let report =
+        associate_compiler_calls(&store, &[wrong], &inputs, Path::new("."), &mut || false).unwrap();
     assert_eq!(report.gaps[0].reason, Gap::CallsiteNotUnique);
 }
 
@@ -440,7 +545,9 @@ fn unknown_dynamic_and_wrong_owners_do_not_become_direct_edges() {
     changed.owner = Some(declaration(SOURCE, "other()", "other"));
     variants.push((changed, Gap::CallerMismatch));
     for (changed, expected) in variants {
-        let report = associate_compiler_calls(&store, &[changed], &inputs, &mut || false).unwrap();
+        let report =
+            associate_compiler_calls(&store, &[changed], &inputs, Path::new("."), &mut || false)
+                .unwrap();
         assert!(report.resolved.is_empty());
         assert_eq!(report.gaps[0].reason, expected);
     }
@@ -450,12 +557,13 @@ fn unknown_dynamic_and_wrong_owners_do_not_become_direct_edges() {
 #[test]
 fn selected_declarations_survive_missing_definitions_without_guessing_a_body() {
     let source = "int external(int); int external(double); int selected(int value) { return external(value); }";
+    let hash = blake3::hash(source.as_bytes()).to_hex().to_string();
     let facts = extract_file_with_mode(
         &create_frontend(Language::Cpp).unwrap(),
         FileId::generate("sample.cpp"),
         Path::new("sample.cpp"),
         source,
-        "declaration-input",
+        &hash,
         ExtractionMode::Structural,
         &(),
     )
@@ -476,9 +584,17 @@ fn selected_declarations_survive_missing_definitions_without_guessing_a_body() {
         owner: Some(declaration(source, "selected(int", "selected")),
         dispatch: CompilerDispatch::Direct,
     };
-    let inputs = BTreeMap::from([("sample.cpp".into(), "declaration-input".into())]);
-    let report =
-        associate_compiler_calls(&store, &[observation.clone()], &inputs, &mut || false).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    std::fs::write(root.path().join("sample.cpp"), source).unwrap();
+    let inputs = BTreeMap::from([("sample.cpp".into(), hash)]);
+    let report = associate_compiler_calls(
+        &store,
+        &[observation.clone()],
+        &inputs,
+        root.path(),
+        &mut || false,
+    )
+    .unwrap();
     assert_eq!(report.resolved.len(), 1, "{:?}", report.gaps);
     let binding = &report.resolved[0];
     let target = store
@@ -512,9 +628,18 @@ fn selected_declarations_survive_missing_definitions_without_guessing_a_body() {
         } else {
             invalid.declaration.location.start_byte += 1;
         }
-        let report = associate_compiler_calls(&store, &[invalid], &inputs, &mut || false).unwrap();
+        let report =
+            associate_compiler_calls(&store, &[invalid], &inputs, root.path(), &mut || false)
+                .unwrap();
         assert!(report.resolved.is_empty());
-        assert_eq!(report.gaps[0].reason, Gap::SymbolNotUnique);
+        assert_eq!(
+            report.gaps[0].reason,
+            if bad_definition {
+                Gap::SymbolNotUnique
+            } else {
+                Gap::InvalidLocation
+            }
+        );
     }
 }
 
@@ -522,21 +647,29 @@ fn selected_declarations_survive_missing_definitions_without_guessing_a_body() {
 fn conflicting_or_incomplete_observations_at_one_call_keep_ambiguity() {
     let (store, inputs, observation) = case();
     let mut other = observation.clone();
-    other.definition = Some(declaration(SOURCE, "read(int)", "read"));
+    other.definition = Some(declaration(SOURCE, "read(int)", "Target::read"));
     for observations in [
         [observation.clone(), other.clone()],
         [other, observation.clone()],
     ] {
         let report =
-            associate_compiler_calls(&store, &observations, &inputs, &mut || false).unwrap();
+            associate_compiler_calls(&store, &observations, &inputs, Path::new("."), &mut || {
+                false
+            })
+            .unwrap();
         assert!(report.resolved.is_empty());
         assert_eq!(report.gaps[0].reason, Gap::ConflictingTargets);
     }
     let mut incomplete = observation.clone();
     incomplete.dispatch = CompilerDispatch::Virtual;
-    let report =
-        associate_compiler_calls(&store, &[observation, incomplete], &inputs, &mut || false)
-            .unwrap();
+    let report = associate_compiler_calls(
+        &store,
+        &[observation, incomplete],
+        &inputs,
+        Path::new("."),
+        &mut || false,
+    )
+    .unwrap();
     assert!(report.resolved.is_empty());
     assert_eq!(report.gaps[0].reason, Gap::DynamicDispatch);
 }
@@ -547,9 +680,20 @@ fn field_observations_and_cancelled_batches_do_not_mutate_calls() {
     let before = store.get_all_call_references().unwrap();
     observation.kind = CompilerObservationKind::FieldReference;
     observation.dispatch = CompilerDispatch::NotACall;
-    let report =
-        associate_compiler_calls(&store, &[observation.clone()], &inputs, &mut || false).unwrap();
+    let report = associate_compiler_calls(
+        &store,
+        &[observation.clone()],
+        &inputs,
+        Path::new("."),
+        &mut || false,
+    )
+    .unwrap();
     assert!(report.resolved.is_empty());
-    assert!(associate_compiler_calls(&store, &[observation], &inputs, &mut || true).is_err());
+    assert!(
+        associate_compiler_calls(&store, &[observation], &inputs, Path::new("."), &mut || {
+            true
+        })
+        .is_err()
+    );
     assert_eq!(before, store.get_all_call_references().unwrap());
 }

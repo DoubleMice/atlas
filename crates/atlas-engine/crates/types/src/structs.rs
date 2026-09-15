@@ -130,6 +130,11 @@ pub mod layer {
     /// cross-file reference resolution. Does NOT include full references,
     /// scopes, or dataflow.
     pub const RESOLUTION_SYMBOLS: &str = "resolution_symbols";
+    /// Compiler-selected declaration endpoints without extracted source semantics.
+    /// These support navigation/call identity, not source name lookup or body analysis.
+    /// Only identity, kind, names and location are populated; other fields do not
+    /// establish visibility, staticness, container membership or callable signatures.
+    pub const COMPILER_DECLARATION: &str = "compiler_declaration";
     /// Full symbols + references + scopes (from `--analysis structural`).
     pub const STRUCTURAL: &str = "structural";
     /// Dataflow nodes/edges (from lazy dataflow or `--analysis full`).

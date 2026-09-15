@@ -29,6 +29,8 @@ fn location(source: &str, text: &str) -> CompilerLocation {
 fn input() -> CompilerCallInput {
     let target = CompilerDeclaration {
         name: "target".into(),
+        kind: atlas_engine::SymbolKind::Function,
+        qualified_name: "Left::target".into(),
         location: location(SOURCE, "target"),
     };
     let mut at = location(SOURCE, "Left::target()");
@@ -47,6 +49,8 @@ fn input() -> CompilerCallInput {
             definition: Some(target),
             owner: Some(CompilerDeclaration {
                 name: "selected".into(),
+                kind: atlas_engine::SymbolKind::Function,
+                qualified_name: "selected".into(),
                 location: location(SOURCE, "selected"),
             }),
             dispatch: CompilerDispatch::Direct,
@@ -164,6 +168,8 @@ fn conflicting_compiler_targets_cannot_fall_back_to_a_source_primary_target() {
     let start = SOURCE.find("namespace Right").unwrap() + "namespace Right { int ".len();
     let target = CompilerDeclaration {
         name: "target".into(),
+        kind: atlas_engine::SymbolKind::Function,
+        qualified_name: "Right::target".into(),
         location: CompilerLocation {
             path: "sample.cpp".into(),
             start_byte: start as u32,
@@ -305,11 +311,15 @@ fn selected_header_declaration_preserves_the_independently_resolved_body() {
             call_expression: Some(location(caller, "Factory::choose(value)")),
             declaration: CompilerDeclaration {
                 name: "choose".into(),
+                kind: atlas_engine::SymbolKind::Method,
+                qualified_name: "Factory::choose".into(),
                 location: selected,
             },
             definition: None,
             owner: Some(CompilerDeclaration {
                 name: "selected".into(),
+                kind: atlas_engine::SymbolKind::Function,
+                qualified_name: "selected".into(),
                 location: location(caller, "selected"),
             }),
             dispatch: CompilerDispatch::Direct,
@@ -358,11 +368,15 @@ fn a_compiler_selected_overload_does_not_inherit_another_overloads_body() {
             call_expression: Some(location(text, "target(1)")),
             declaration: CompilerDeclaration {
                 name: "target".into(),
+                kind: atlas_engine::SymbolKind::Function,
+                qualified_name: "target".into(),
                 location: declaration.clone(),
             },
             definition: None,
             owner: Some(CompilerDeclaration {
                 name: "selected".into(),
+                kind: atlas_engine::SymbolKind::Function,
+                qualified_name: "selected".into(),
                 location: location(text, "selected"),
             }),
             dispatch: CompilerDispatch::Direct,
@@ -372,6 +386,7 @@ fn a_compiler_selected_overload_does_not_inherit_another_overloads_body() {
         &store,
         &compiler.observations,
         &compiler.inputs,
+        root.path(),
         &mut || false,
     )
     .unwrap();
@@ -475,11 +490,15 @@ fn declared_body_case(
             call_expression: Some(location(caller, "acquire()->read()")),
             declaration: CompilerDeclaration {
                 name: "read".into(),
+                kind: atlas_engine::SymbolKind::Method,
+                qualified_name: "Api::read".into(),
                 location: declaration,
             },
             definition: None,
             owner: Some(CompilerDeclaration {
                 name: "selected".into(),
+                kind: atlas_engine::SymbolKind::Function,
+                qualified_name: "selected".into(),
                 location: location(caller, "selected"),
             }),
             dispatch: CompilerDispatch::Direct,
@@ -577,4 +596,108 @@ fn canceled_compiler_association_is_not_finalized_and_can_be_retried() {
             .as_ref()
             .is_some_and(|t| t.strategy == ResolutionStrategy::Compiler)
     }));
+}
+
+#[test]
+fn compiler_only_declarations_have_bounded_identity_and_are_removed_with_the_input() {
+    let text = "#define FUNCTION(name) int name() { return 1; }\nnamespace Api { FUNCTION(make) }\nint entry() { return Api::make(); } int neighbor() { return Api::make(); }\nint local() { return 2; } int ordinary() { return local(); }\n";
+    let (root, store) = setup();
+    std::fs::write(root.path().join("sample.cpp"), text).unwrap();
+    run(&store, root.path(), None);
+    let baseline = calls(&store);
+    let source_symbols = store.get_all_symbols().unwrap();
+    let mut at = location(text, "FUNCTION(make)");
+    at.start_byte += 9;
+    at.end_byte -= 1;
+    assert!(
+        !source_symbols
+            .iter()
+            .any(|symbol| symbol.name_range.start_byte == at.start_byte)
+    );
+    let declared = CompilerDeclaration {
+        name: "make".into(),
+        kind: atlas_engine::SymbolKind::Function,
+        qualified_name: "Api::make".into(),
+        location: at,
+    };
+    let mut occurrence = location(text, "Api::make()");
+    occurrence.start_byte += 5;
+    occurrence.end_byte -= 2;
+    let compiler = CompilerCallInput {
+        inputs: BTreeMap::from([(
+            "sample.cpp".into(),
+            blake3::hash(text.as_bytes()).to_hex().to_string(),
+        )]),
+        observations: vec![CompilerObservation {
+            kind: CompilerObservationKind::CallDeclaration,
+            location: occurrence,
+            call_expression: Some(location(text, "Api::make()")),
+            declaration: declared.clone(),
+            definition: Some(declared),
+            owner: Some(CompilerDeclaration {
+                name: "entry".into(),
+                kind: atlas_engine::SymbolKind::Function,
+                qualified_name: "entry".into(),
+                location: location(text, "entry"),
+            }),
+            dispatch: CompilerDispatch::Direct,
+        }],
+    };
+    run(&store, root.path(), Some(compiler.clone()));
+    let admitted: Vec<_> = store
+        .get_all_symbols()
+        .unwrap()
+        .into_iter()
+        .filter(|symbol| symbol.layer == atlas_engine::layer::COMPILER_DECLARATION)
+        .collect();
+    assert_eq!(admitted.len(), 1);
+    let endpoint = &admitted[0];
+    assert_eq!(endpoint.qualified_name, "Api::make");
+    assert_eq!(endpoint.range, endpoint.name_range);
+    assert!(endpoint.signature.is_none());
+    let edges = store.get_all_edges().unwrap();
+    let selected: Vec<_> = edges
+        .iter()
+        .filter(|edge| edge.target == endpoint.id)
+        .collect();
+    assert_eq!(
+        selected.len(),
+        1,
+        "an unobserved neighboring call must remain unresolved"
+    );
+    assert_eq!(selected[0].provenance, Provenance::Compiler);
+    assert!(
+        gaps(&store)
+            .iter()
+            .any(|gap| gap.reason == CompilerBindingGapReason::DefinitionNotIndexed)
+    );
+    let stable = calls(&store);
+    let repeated = run(&store, root.path(), Some(compiler.clone()));
+    assert_eq!(repeated.indexed, 0);
+    assert_eq!(repeated.edges_built, 0);
+    assert_eq!(stable, calls(&store));
+    // Conflicting declaration metadata at the same written invocation admits neither endpoint.
+    let mut conflict = compiler.clone();
+    let mut alternative = compiler.observations[0].clone();
+    alternative.declaration.qualified_name = "Other::make".into();
+    alternative.definition = Some(alternative.declaration.clone());
+    conflict.observations.push(alternative);
+    run(&store, root.path(), Some(conflict));
+    assert_eq!(baseline, calls(&store));
+    assert!(
+        store
+            .get_all_symbols()
+            .unwrap()
+            .iter()
+            .all(|symbol| symbol.layer != atlas_engine::layer::COMPILER_DECLARATION)
+    );
+    run(&store, root.path(), Some(compiler));
+    assert_eq!(stable, calls(&store));
+    run(&store, root.path(), None);
+    assert_eq!(baseline, calls(&store));
+    let mut after = store.get_all_symbols().unwrap();
+    let mut before = source_symbols;
+    after.sort_by_key(|symbol| symbol.id);
+    before.sort_by_key(|symbol| symbol.id);
+    assert_eq!(before, after);
 }

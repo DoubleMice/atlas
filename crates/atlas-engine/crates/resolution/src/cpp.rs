@@ -213,6 +213,20 @@ impl TypeIndex {
         files: HashMap<FileId, CppFileTypes>,
         store: &db::Store,
     ) -> anyhow::Result<Self> {
+        let source_symbols;
+        let symbols = if symbols
+            .iter()
+            .any(|symbol| symbol.layer == layer::COMPILER_DECLARATION)
+        {
+            source_symbols = symbols
+                .iter()
+                .filter(|symbol| symbol.layer != layer::COMPILER_DECLARATION)
+                .cloned()
+                .collect::<Vec<_>>();
+            source_symbols.as_slice()
+        } else {
+            symbols
+        };
         let by_id: HashMap<_, _> = symbols.iter().map(|s| (s.id, s)).collect();
         let mut index = Self {
             files,

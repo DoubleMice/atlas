@@ -86,7 +86,7 @@ impl IndexPipeline {
             .compiler_calls
             .as_ref()
             .map(|input| {
-                serde_json::to_vec(&("compiler-call-binding-v4", input))
+                serde_json::to_vec(&("compiler-call-binding-v5", input))
                     .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
             })
             .transpose()?
@@ -339,6 +339,8 @@ impl IndexPipeline {
             self.store.invalidate_all_references()?;
             self.store.delete_all_edges()?;
             self.store.delete_metadata(KEY_COMPILER_CALL_GAPS)?;
+            self.store
+                .replace_symbols_in_layer(types::layer::COMPILER_DECLARATION, &[])?;
         }
         self.store
             .set_metadata(KEY_COMPILER_CALL_INPUT, &compiler_hash)?;
@@ -575,6 +577,7 @@ impl IndexPipeline {
                             &self.store,
                             &input.observations,
                             &input.inputs,
+                            &self.project_root,
                             &mut || (*int_cell.lock().expect("cancellation check lock poisoned"))(),
                         )
                     })

@@ -1,9 +1,10 @@
-//! Associate applicable compiler-selected direct calls with existing index identities.
+//! Associate applicable compiler-selected direct calls with indexed invocations.
 //!
 //! The producer is responsible for compiler validity, configuration and source
 //! consistency. This step checks indexed input identities and exact locations;
 //! it is not a compiler or a validator of arbitrary third-party claims. It does
-//! not mutate references or graphs. A building pipeline may combine its results
+//! not mutate the store. Missing declarations can become declaration-only
+//! endpoints in its result. A building pipeline may combine its results
 //! with source resolutions before publishing; Ready queries must stay read-only.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -13,7 +14,7 @@ use db::Store;
 use serde::{Deserialize, Serialize};
 use types::{
     CallsiteId, Confidence, FileId, Language, Provenance, ReferenceId, ReferenceKind, ReferenceUse,
-    ResolutionStrategy, ResolvedTarget, SymbolDef, SymbolId, SymbolKind,
+    ResolutionStrategy, ResolvedTarget, SymbolDef, SymbolId, SymbolKind, TextRange, layer,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -26,6 +27,10 @@ pub struct CompilerLocation {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CompilerDeclaration {
     pub name: String,
+    /// Declaration category and semantic name supplied by the compiler producer.
+    /// These do not describe an instantiated body or runtime receiver identity.
+    pub kind: SymbolKind,
+    pub qualified_name: String,
     pub location: CompilerLocation,
 }
 
@@ -62,6 +67,7 @@ pub enum CompilerBindingGapReason {
     DynamicDispatch,
     OwnerUnavailable,
     DefinitionUnavailable,
+    DefinitionNotIndexed,
     CallExpressionUnavailable,
     InputIdentityUnavailable,
     IndexedInputMismatch,
@@ -112,12 +118,16 @@ pub struct CompilerCallResolution {
 pub struct CompilerCallBindings {
     pub resolved: Vec<CompilerCallResolution>,
     pub gaps: Vec<CompilerBindingGap>,
+    /// New declaration-only endpoints, admitted only for retained direct bindings.
+    pub declarations: Vec<SymbolDef>,
 }
 
 struct Association<'a> {
     store: &'a Store,
     inputs: &'a BTreeMap<String, String>,
     symbols: HashMap<FileId, Vec<SymbolDef>>,
+    source_root: &'a Path,
+    declarations: HashMap<SymbolId, SymbolDef>,
 }
 
 type Attempt<T> = anyhow::Result<Result<T, CompilerBindingGapReason>>;
@@ -175,6 +185,99 @@ impl Association<'_> {
         } else {
             Err(CompilerBindingGapReason::SymbolNotUnique)
         })
+    }
+
+    fn admit_declaration(&mut self, declaration: &CompilerDeclaration) -> Attempt<SymbolId> {
+        use CompilerBindingGapReason as Gap;
+        let file_id = match self.file(&declaration.location)? {
+            Ok(file) => file,
+            Err(reason) => return Ok(Err(reason)),
+        };
+        let file = self
+            .store
+            .get_file(&file_id)?
+            .expect("checked indexed file");
+        if !matches!(file.language, Language::Cpp | Language::C)
+            || !matches!(
+                declaration.kind,
+                SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor
+            )
+            || declaration.name.is_empty()
+            || !(declaration.qualified_name == declaration.name
+                || declaration
+                    .qualified_name
+                    .ends_with(&format!("::{}", declaration.name)))
+        {
+            return Ok(Err(Gap::SymbolNotUnique));
+        }
+        // An existing, differently classified symbol is an extraction disagreement,
+        // not permission to insert another identity at the same declaration.
+        if self.symbols[&file_id].iter().any(|symbol| {
+            symbol.name_range.start_byte == declaration.location.start_byte
+                && symbol.name_range.end_byte == declaration.location.end_byte
+        }) {
+            return Ok(Err(Gap::SymbolNotUnique));
+        }
+        let Ok(source) = std::fs::read_to_string(self.source_root.join(&file.path)) else {
+            return Ok(Err(Gap::IndexedInputMismatch));
+        };
+        if blake3::hash(source.as_bytes()).to_hex().as_str() != file.content_hash {
+            return Ok(Err(Gap::IndexedInputMismatch));
+        }
+        let at = &declaration.location;
+        let (start, end) = (at.start_byte as usize, at.end_byte as usize);
+        if source.get(start..end) != Some(declaration.name.as_str()) {
+            return Ok(Err(Gap::InvalidLocation));
+        }
+        let point = |offset: usize| {
+            let before = &source.as_bytes()[..offset];
+            (
+                before.iter().filter(|byte| **byte == b'\n').count() as u32,
+                before
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(offset, |newline| offset - newline - 1) as u32,
+            )
+        };
+        let (start_line, start_column) = point(start);
+        let (end_line, end_column) = point(end);
+        let range = TextRange {
+            start_byte: at.start_byte,
+            end_byte: at.end_byte,
+            start_line,
+            start_column,
+            end_line,
+            end_column,
+        };
+        let id = SymbolId::generate(
+            &file_id,
+            file.language.as_str(),
+            &declaration.qualified_name,
+            declaration.kind.as_str(),
+            Some(&format!("compiler-declaration:{}", at.start_byte)),
+        );
+        self.declarations.entry(id).or_insert_with(|| SymbolDef {
+            id,
+            kind: declaration.kind,
+            name: declaration.name.clone(),
+            qualified_name: declaration.qualified_name.clone(),
+            symbol_path: Vec::new(),
+            file_id,
+            language: file.language,
+            range,
+            name_range: range,
+            signature: None,
+            visibility: None,
+            exported: false,
+            static_: false,
+            async_: false,
+            container: None,
+            scope_id: None,
+            package_name: None,
+            namespace_path: Vec::new(),
+            layer: layer::COMPILER_DECLARATION.into(),
+        });
+        Ok(Ok(id))
     }
 
     fn reference(&self, observation: &CompilerObservation) -> Attempt<(CallsiteId, ReferenceUse)> {
@@ -235,6 +338,12 @@ impl Association<'_> {
         if observation.dispatch != CompilerDispatch::Direct {
             return Ok(Err(Gap::DynamicDispatch));
         }
+        if !matches!(
+            observation.declaration.kind,
+            SymbolKind::Function | SymbolKind::Method | SymbolKind::Constructor
+        ) {
+            return Ok(Err(Gap::ReferenceMismatch));
+        }
         let Some(owner) = &observation.owner else {
             return Ok(Err(Gap::OwnerUnavailable));
         };
@@ -254,6 +363,20 @@ impl Association<'_> {
         }
         let target_id = match self.symbol(target)? {
             Ok(id) => id,
+            Err(CompilerBindingGapReason::SymbolNotUnique)
+                if target.location == observation.declaration.location
+                    && target.name == observation.declaration.name =>
+            {
+                if target.kind != observation.declaration.kind
+                    || target.qualified_name != observation.declaration.qualified_name
+                {
+                    return Ok(Err(Gap::ReferenceMismatch));
+                }
+                match self.admit_declaration(&observation.declaration)? {
+                    Ok(id) => id,
+                    Err(reason) => return Ok(Err(reason)),
+                }
+            }
             Err(reason) => return Ok(Err(reason)),
         };
         if target.name != observation.declaration.name {
@@ -275,19 +398,25 @@ impl Association<'_> {
 /// Match compiler-selected direct calls against the same indexed source inputs.
 /// `inputs` uses the index's existing per-file content identities, captured for
 /// the compiler run. Callers must not populate it from an unrelated later index.
-/// Missing definitions retain the selected indexed declaration and a body gap.
+/// Missing definitions retain the selected declaration and a body gap. When its
+/// source symbol was not extracted, `source_root` supplies the immutable bytes
+/// needed to admit the producer's typed declaration at the exact name range.
+/// This does not extract a body, container, signature or source visibility.
 /// Fields, virtual dispatch, absent owners and conflicting targets cannot turn
 /// into direct calls. No nearest-name or nearest-function fallback.
 pub fn associate_compiler_calls(
     store: &Store,
     observations: &[CompilerObservation],
     inputs: &BTreeMap<String, String>,
+    source_root: &Path,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> anyhow::Result<CompilerCallBindings> {
     let mut association = Association {
         store,
         inputs,
         symbols: HashMap::new(),
+        source_root,
+        declarations: HashMap::new(),
     };
     let mut report = CompilerCallBindings::default();
     // A changed indexed dependency can invalidate calls in an unchanged file.
@@ -361,13 +490,24 @@ pub fn associate_compiler_calls(
             }
             Ok(binding) => {
                 let id = binding.reference.id;
-                if observation.definition.is_none() {
+                let declaration_only = association
+                    .declarations
+                    .contains_key(&binding.target.symbol_id);
+                if observation.definition.is_none() || declaration_only {
                     report.gaps.push(CompilerBindingGap {
                         location: observation.location.clone(),
-                        reason: CompilerBindingGapReason::DefinitionUnavailable,
+                        reason: if observation.definition.is_none() {
+                            CompilerBindingGapReason::DefinitionUnavailable
+                        } else {
+                            CompilerBindingGapReason::DefinitionNotIndexed
+                        },
                         reference_id: Some(id),
                         input_path: None,
-                        declaration_location: None,
+                        declaration_location: if declaration_only {
+                            declaration_location.clone()
+                        } else {
+                            None
+                        },
                         declaration_id: None,
                     });
                 }
@@ -397,6 +537,17 @@ pub fn associate_compiler_calls(
         .map(|(_, (value, _))| value)
         .collect();
     report.resolved.sort_by_key(|binding| binding.reference.id);
+    let retained: HashSet<_> = report
+        .resolved
+        .iter()
+        .map(|binding| binding.target.symbol_id)
+        .collect();
+    report.declarations = association
+        .declarations
+        .into_values()
+        .filter(|symbol| retained.contains(&symbol.id))
+        .collect();
+    report.declarations.sort_by_key(|symbol| symbol.id);
     Ok(report)
 }
 
@@ -412,6 +563,7 @@ pub fn apply_compiler_call_bindings(
     source: &mut Vec<(ReferenceUse, ResolvedTarget)>,
     bindings: &CompilerCallBindings,
 ) -> anyhow::Result<()> {
+    store.replace_symbols_in_layer(layer::COMPILER_DECLARATION, &bindings.declarations)?;
     // A producer's missing definition is not evidence against a body already
     // selected from source. Retain that result only when its declaration identity
     // agrees with the compiler selection under the existing C++ association rules.

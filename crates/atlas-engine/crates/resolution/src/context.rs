@@ -72,6 +72,21 @@ impl GlobalSymbolIndex {
     /// the symbol list (e.g. shared between resolution and graph building).
     /// The store is still needed for the file → parent directory map.
     pub fn build_from_symbols(symbols: &[SymbolDef], store: &Store) -> anyhow::Result<Self> {
+        // Compiler endpoints do not supply source visibility or callable semantics.
+        let source_symbols;
+        let symbols = if symbols
+            .iter()
+            .any(|symbol| symbol.layer == types::layer::COMPILER_DECLARATION)
+        {
+            source_symbols = symbols
+                .iter()
+                .filter(|symbol| symbol.layer != types::layer::COMPILER_DECLARATION)
+                .cloned()
+                .collect::<Vec<_>>();
+            source_symbols.as_slice()
+        } else {
+            symbols
+        };
         let mut by_name: HashMap<String, Vec<SymbolDef>> = HashMap::new();
         let mut by_id: HashMap<SymbolId, SymbolDef> = HashMap::new();
         let mut lower_names: Vec<String> = Vec::with_capacity(symbols.len());

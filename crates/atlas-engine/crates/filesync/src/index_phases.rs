@@ -994,7 +994,7 @@ fn resolve_and_build(
 
     // ── Symbol pre-load (shared between resolution and graph building) ──
     let t_symbols = Instant::now();
-    let all_symbols = store.get_all_symbols()?;
+    let mut all_symbols = store.get_all_symbols()?;
     let graph_symbol_load_ms = t_symbols.elapsed().as_millis() as u64;
 
     // ── Resolution ──
@@ -1005,6 +1005,7 @@ fn resolve_and_build(
         .context("Reference resolution failed")?;
     if let Some(bindings) = compiler {
         resolution::compiler::apply_compiler_call_bindings(store, &mut resolved_refs, bindings)?;
+        all_symbols.extend(bindings.declarations.iter().cloned());
     }
     let resolved_count = resolved_refs
         .iter()
