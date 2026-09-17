@@ -1,6 +1,8 @@
 use super::*;
 use crate::{ExtractionMode, IndexPipeline, IndexPipelineOptions, NoopSink};
 
+mod navigation;
+
 fn fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<Store>) {
     let root = tempfile::tempdir().unwrap();
     for (path, source) in files {
@@ -1009,19 +1011,19 @@ void ambiguous() { int task = 1; int task = 2; ambiguous_use(task); }
         .items
         .iter()
         .filter(|item| {
-            item.subject.call().unwrap().name == "compound" && item.role == "argument_expression"
+            item.subject
+                .call()
+                .is_some_and(|call| call.name == "compound")
+                && item.role == "argument_expression"
         })
         .map(|item| item_text(root.path(), &store, item))
         .collect();
     assert_eq!(expressions, ["task", "wrap(task)", "7"]);
     // An inner call has its own subject, not the outer call's argument identity.
-    assert!(
-        compound
-            .items
-            .iter()
-            .any(|item| item.subject.call().unwrap().name == "wrap"
-                && item.role == "argument_binding")
-    );
+    assert!(compound.items.iter().any(|item| {
+        item.subject.call().is_some_and(|call| call.name == "wrap")
+            && item.role == "argument_binding"
+    }));
     let captured = inspect(root.path(), &store, source, "captured_use(task)");
     assert!(
         captured
@@ -1207,7 +1209,13 @@ fn initializer_return_and_type_context_work_without_wrapper_dependencies_or_grap
             .any(|g| g.code == "type_declaration_unavailable" && g.message.contains("Missing")),
         "{result:#?}"
     );
-    assert!(result.items.iter().all(|i| !i.related_locations.is_empty()));
+    assert!(
+        result
+            .items
+            .iter()
+            .filter(|i| !matches!(i.role, "selected_callable" | "enclosing_callable"))
+            .all(|i| !i.related_locations.is_empty())
+    );
     // Same-name types in another namespace are still hypotheses, never exclusions.
     let member_names: BTreeSet<_> = result
         .items

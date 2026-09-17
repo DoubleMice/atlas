@@ -17,6 +17,7 @@ use types::*;
 mod control;
 mod cpp;
 mod function;
+mod navigation;
 mod operations;
 mod preprocessing;
 pub mod references;
@@ -76,9 +77,18 @@ impl ContextSubject {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextItemKind {
+    Declaration,
+    Definition,
+    Reference,
+    ControlCondition,
+}
+
 #[derive(Debug, Clone)]
 pub struct CallContextItem {
     pub subject: ContextSubject,
+    pub kind: ContextItemKind,
     /// The item's role in an investigation, never a relationship strength.
     pub role: &'static str,
     pub location: ContextLocation,
@@ -118,8 +128,8 @@ struct Investigation<'a> {
     symbol_static: BTreeMap<SymbolId, bool>,
 }
 
-/// Inspect stored calls that intersect a source byte range, or written C++ value
-/// uses when the region has no stored calls. This uses
+/// Navigate indexed C++ callable names and containing bodies independently of
+/// stored calls, then inspect intersecting calls or written value uses. This uses
 /// stored lexical scopes/bindings and parses only the source needed for their
 /// declaration/initializer syntax. Currently C++ supplies receiver and argument context;
 /// unsupported languages retain an explicit limitation. Results never alter Store.
@@ -157,6 +167,7 @@ pub fn inspect_call_context(
                 && start_byte < r.range.end_byte
         })
         .collect();
+    query.callable_navigation(&file, start_byte, end_byte)?;
     if include_control_conditions {
         query.control_conditions(file.file_id, start_byte, end_byte)?;
     }
@@ -219,6 +230,16 @@ impl Investigation<'_> {
         self.reserve_item()?;
         self.result.items.push(CallContextItem {
             subject: ContextSubject::reference(call),
+            kind: match role {
+                "initializer"
+                | "type_reference"
+                | "type_alias_target"
+                | "argument_expression"
+                | "argument_initializer"
+                | "callable_name"
+                | "template_arguments" => ContextItemKind::Reference,
+                _ => ContextItemKind::Declaration,
+            },
             role,
             location,
             symbol_id,

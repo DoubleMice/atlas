@@ -123,6 +123,7 @@ impl Investigation<'_> {
         for location in &directives {
             self.reserve_item()?;
             self.result.items.push(CallContextItem {
+                kind: ContextItemKind::Reference,
                 subject: subject.clone(),
                 role: "preprocessing_directive",
                 location: location.clone(),

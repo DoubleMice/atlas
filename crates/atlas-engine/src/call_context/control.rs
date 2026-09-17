@@ -399,6 +399,7 @@ impl Investigation<'_> {
             };
             self.reserve_item()?;
             self.result.items.push(CallContextItem {
+                kind: ContextItemKind::ControlCondition,
                 subject: subject.clone(), role,
                 location: ContextLocation { file_id, range: cpp::range(condition) },
                 symbol_id: None,
@@ -410,6 +411,7 @@ impl Investigation<'_> {
             self.check()?;
             self.reserve_item()?;
             self.result.items.push(CallContextItem {
+                kind: ContextItemKind::ControlCondition,
                 subject: subject.clone(), role,
                 location: ContextLocation { file_id, range: condition },
                 symbol_id: None,
