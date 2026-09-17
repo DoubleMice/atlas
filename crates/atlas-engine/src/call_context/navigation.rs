@@ -1,6 +1,26 @@
 //! Source-position navigation using indexed callable identities. No call resolution.
 use super::*;
 
+// Body extent must end in written syntax, not a parser-inserted boundary.
+// Errors inside the body do not invalidate independently recorded ownership.
+// This also works for function try-blocks: inspect the outermost boundary leaves,
+// rather than rejecting the entire subtree for an unrelated statement error.
+fn written_body(callable: Node<'_>) -> Option<Node<'_>> {
+    let body = callable.child_by_field_name("body")?;
+    let first = std::iter::successors(Some(body), |n| n.child(0)).last()?;
+    let last = std::iter::successors(Some(body), |n| {
+        n.child(u32::try_from(n.child_count().checked_sub(1)?).ok()?)
+    })
+    .last()?;
+    (!body.is_missing()
+        && !body.is_error()
+        && !first.is_missing()
+        && first.start_byte() < first.end_byte()
+        && !last.is_missing()
+        && last.start_byte() < last.end_byte())
+    .then_some(body)
+}
+
 impl Investigation<'_> {
     pub(super) fn callable_navigation(
         &mut self,
@@ -59,7 +79,7 @@ impl Investigation<'_> {
                 let definition = syntax.is_some_and(|n| {
                     n.kind() == "function_definition"
                         && cpp::range(n) == symbol.range
-                        && n.child_by_field_name("body").is_some()
+                        && written_body(n).is_some()
                 });
                 self.reserve_item()?;
                 self.result.items.push(CallContextItem {
@@ -71,6 +91,11 @@ impl Investigation<'_> {
                     symbol_id: Some(symbol.id), related_locations: vec![],
                     message: "The selection names this indexed callable declaration. A definition range is returned only when its recorded identity matches the source definition; no call target is selected.".into(),
                 });
+                if !definition && syntax.is_some_and(|n| cpp::range(n) == symbol.range) {
+                    self.navigation_gap(subject, "callable_navigation_unavailable",
+                        "The callable declaration is recorded, but the body extent depends on parser recovery. The name remains navigable; inspect the source before choosing a body range.",
+                        vec![ContextLocation { file_id: file.file_id, range: symbol.range }])?;
+                }
                 return Ok(());
             }
         }
@@ -84,7 +109,7 @@ impl Investigation<'_> {
         let syntax =
             extraction::cpp_expressions::expression_function(parsed.tree.root_node(), at.range);
         if let Some(syntax) = syntax
-            && syntax.child_by_field_name("body").is_some_and(|body| {
+            && written_body(syntax).is_some_and(|body| {
                 body.start_byte() <= start as usize && end as usize <= body.end_byte()
             })
             && !self.crosses_nested_body(syntax, start, end)?

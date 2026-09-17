@@ -137,3 +137,50 @@ fn callable_navigation_retains_local_facts_when_other_source_is_broken() {
     );
     assert!(inspect_call_context(&store, root.path(), "main.cpp", 0, 1, false, &|| true).is_err());
 }
+
+#[test]
+fn callable_navigation_does_not_promote_a_recovered_body_boundary() {
+    for source in [
+        "int broken() { return 1;",
+        "int outer() { auto broken = []() { return 1;",
+    ] {
+        let (root, store) = fixture(&[("main.cpp", source)]);
+        for selection in ["broken", "return 1"] {
+            let result = inspect(root.path(), &store, source, selection);
+            assert!(
+                navigation(&result)
+                    .iter()
+                    .all(|item| item.kind != ContextItemKind::Definition),
+                "{result:?}"
+            );
+            assert!(
+                result
+                    .gaps
+                    .iter()
+                    .any(|g| g.code == "callable_navigation_unavailable")
+            );
+        }
+    }
+    let source = "int broken() { return 1;";
+    let (root, store) = fixture(&[("main.cpp", source)]);
+    let result = inspect(root.path(), &store, source, "broken");
+    assert!(
+        navigation(&result)
+            .iter()
+            .any(|item| item.kind == ContextItemKind::Declaration)
+    );
+    // Actual body delimiters preserve the scope despite an unrelated bad statement.
+    for source in [
+        "int usable() { @; return 2; }",
+        "int usable() try { return 2; } catch (...) { return 0; }",
+    ] {
+        let (root, store) = fixture(&[("main.cpp", source)]);
+        let result = inspect(root.path(), &store, source, "return 2");
+        assert!(
+            navigation(&result)
+                .iter()
+                .any(|item| item.kind == ContextItemKind::Definition),
+            "{result:?}"
+        );
+    }
+}
