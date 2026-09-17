@@ -2,11 +2,72 @@ use std::collections::{HashMap, HashSet};
 
 use rusqlite::OptionalExtension;
 use types::{
-    FileId,
-    cpp::{CppFileTypes, CppLookupLimit},
+    FileId, ReferenceId, TextRange,
+    cpp::{
+        CppFileTypes, CppLookupLimit, CppTypeLookupContext, CppTypeLookupFailure,
+        CppTypeLookupFailureKind, CppTypeLookupSharing,
+    },
 };
 
 use super::Store;
+
+/// Exact selected failures and global grouping evidence for each returned reference.
+#[derive(Debug, Default)]
+pub struct CppTypeLookupSelection {
+    pub failures: HashMap<ReferenceId, CppTypeLookupFailure>,
+    pub sharing: HashMap<ReferenceId, CppTypeLookupSharing>,
+    pub work: CppTypeLookupReadWork,
+}
+
+/// Logical work, not SQLite page reads or a byte/memory bound. SQLite still
+/// parses stored JSON to extract each global context; unrelated inventories are
+/// not deserialized into Rust values.
+#[derive(Debug, Default)]
+pub struct CppTypeLookupReadWork {
+    pub unique_references_requested: usize,
+    pub failures_decoded: usize,
+    pub global_contexts_examined: usize,
+    pub matching_inventories_examined: usize,
+    pub declaration_lists_decoded: usize,
+}
+
+#[derive(Default)]
+struct FailureDecoder {
+    lists: HashMap<String, Vec<(FileId, TextRange)>>,
+    memo_bytes: usize,
+    lists_decoded: usize,
+}
+
+impl FailureDecoder {
+    fn declarations(&mut self, related: String) -> anyhow::Result<Vec<(FileId, TextRange)>> {
+        if let Some(list) = self.lists.get(&related) {
+            return Ok(list.clone());
+        }
+        let list: Vec<(FileId, TextRange)> = serde_json::from_str(&related)?;
+        self.lists_decoded += 1;
+        // Bound cached payload, not map overhead or the returned inventories.
+        const MEMO_BYTES: usize = 8 * 1024 * 1024;
+        let bytes = related.capacity().saturating_add(
+            list.capacity()
+                .saturating_mul(std::mem::size_of::<(FileId, TextRange)>()),
+        );
+        if bytes <= MEMO_BYTES {
+            if self.memo_bytes + bytes > MEMO_BYTES {
+                self.lists.clear();
+                self.memo_bytes = 0;
+            }
+            self.memo_bytes += bytes;
+            self.lists.insert(related, list.clone());
+        }
+        Ok(list)
+    }
+
+    fn failure(&mut self, json: &str, related: String) -> anyhow::Result<CppTypeLookupFailure> {
+        let mut failure: CppTypeLookupFailure = serde_json::from_str(json)?;
+        failure.related_declarations = self.declarations(related)?;
+        Ok(failure)
+    }
+}
 
 impl Store {
     pub fn cpp_allocation_site_count(&self) -> anyhow::Result<usize> {
@@ -75,39 +136,110 @@ impl Store {
                 row.get::<_, String>(2)?,
             ))
         })?;
-        // Many calls stop on the same declaration inventory. Decode each
-        // repeated list once, while retaining every call's distinct diagnostic.
-        // This per-read memo bounds cached string/vector payload, not map overhead.
-        const MEMO_BYTES: usize = 8 * 1024 * 1024;
-        let mut lists = HashMap::<String, Vec<(FileId, types::TextRange)>>::new();
-        let mut memo_bytes = 0;
+        let mut decoder = FailureDecoder::default();
         let mut failures = HashMap::new();
         for row in rows {
             anyhow::ensure!(!canceled(), "type lookup diagnostic read canceled");
             let (reference, json, related) = row?;
-            let mut failure: types::cpp::CppTypeLookupFailure = serde_json::from_str(&json)?;
-            failure.related_declarations = if let Some(list) = lists.get(&related) {
-                list.clone()
-            } else {
-                let list: Vec<(FileId, types::TextRange)> = serde_json::from_str(&related)?;
-                let bytes = related.capacity().saturating_add(
-                    list.capacity()
-                        .saturating_mul(std::mem::size_of::<(FileId, types::TextRange)>()),
-                );
-                if bytes <= MEMO_BYTES {
-                    if memo_bytes + bytes > MEMO_BYTES {
-                        lists.clear();
-                        memo_bytes = 0;
-                    }
-                    memo_bytes += bytes;
-                    lists.insert(related, list.clone());
-                }
-                list
-            };
-            failures.insert(reference, failure);
+            failures.insert(reference, decoder.failure(&json, related)?);
         }
         anyhow::ensure!(!canceled(), "type lookup diagnostic read canceled");
         Ok(failures)
+    }
+
+    /// Read exact failures for deduplicated reference IDs, with grouping evidence
+    /// from all unresolved failure records in this immutable published Artifact.
+    /// Unknown, resolved and failure-free references are omitted. An empty request
+    /// or a selection with no failures performs no global scan. Cancellation is
+    /// checked at entry, between records and before returning (including empty).
+    ///
+    /// This does not select call owners or project source locations. A shared
+    /// inventory is not sufficient to emit a region if its locations are absent.
+    /// No failure outside the selection is decoded as a failure object; global
+    /// context metadata and matching declaration inventories are still read.
+    pub fn cpp_type_lookup_failures_for_references(
+        &self,
+        references: &[ReferenceId],
+        canceled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<CppTypeLookupSelection> {
+        anyhow::ensure!(!canceled(), "type lookup diagnostic read canceled");
+        let ids: HashSet<_> = references.iter().copied().collect();
+        let mut result = CppTypeLookupSelection::default();
+        result.work.unique_references_requested = ids.len();
+        let conn = self.lock_read();
+        let mut selected = conn.prepare(
+            "SELECT json_set(failure_json, '$.related_declarations', json('[]')),
+                    json_extract(failure_json, '$.related_declarations')
+             FROM \"references\" WHERE reference_id = ?1
+             AND resolved_symbol_id IS NULL AND failure_json IS NOT NULL",
+        )?;
+        let mut decoder = FailureDecoder::default();
+        for id in ids {
+            anyhow::ensure!(!canceled(), "type lookup diagnostic read canceled");
+            let row: Option<(String, String)> = selected
+                .query_row([id], |row| Ok((row.get(0)?, row.get(1)?)))
+                .optional()?;
+            if let Some((json, related)) = row {
+                result.failures.insert(id, decoder.failure(&json, related)?);
+                result.work.failures_decoded += 1;
+            }
+        }
+        if !result.failures.is_empty() {
+            let mut groups = HashMap::new();
+            for failure in result.failures.values() {
+                groups.entry(failure.context()).or_insert((
+                    failure.related_declarations.as_slice(),
+                    CppTypeLookupSharing::default(),
+                ));
+            }
+            let mut contexts = conn.prepare(
+                "SELECT reference_id,
+                        json_extract(failure_json, '$.kind', '$.name', '$.scope', '$.file_id', '$.range')
+                 FROM \"references\" WHERE resolved_symbol_id IS NULL AND failure_json IS NOT NULL",
+            )?;
+            let rows = contexts.query_map([], |row| {
+                Ok((row.get::<_, ReferenceId>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let mut inventory = conn.prepare(
+                "SELECT json_extract(failure_json, '$.related_declarations')
+                 FROM \"references\" WHERE reference_id = ?1",
+            )?;
+            for row in rows {
+                anyhow::ensure!(!canceled(), "type lookup diagnostic read canceled");
+                let (id, json) = row?;
+                let (kind, name, scope, file_id, range): (
+                    CppTypeLookupFailureKind,
+                    String,
+                    String,
+                    FileId,
+                    TextRange,
+                ) = serde_json::from_str(&json)?;
+                result.work.global_contexts_examined += 1;
+                let key = CppTypeLookupContext {
+                    kind,
+                    name,
+                    scope,
+                    file_id,
+                    range,
+                };
+                if let Some((expected, sharing)) = groups.get_mut(&key) {
+                    result.work.matching_inventories_examined += 1;
+                    if let Some(failure) = result.failures.get(&id) {
+                        sharing.observe(expected, &failure.related_declarations);
+                    } else {
+                        let json = inventory.query_row([id], |row| row.get::<_, String>(0))?;
+                        let declarations = decoder.declarations(json)?;
+                        sharing.observe(expected, &declarations);
+                    }
+                }
+            }
+            for (id, failure) in &result.failures {
+                result.sharing.insert(*id, groups[&failure.context()].1);
+            }
+        }
+        result.work.declaration_lists_decoded = decoder.lists_decoded;
+        anyhow::ensure!(!canceled(), "type lookup diagnostic read canceled");
+        Ok(result)
     }
 
     /// Replace the previous failed attempt, including clearing a formerly
@@ -299,6 +431,173 @@ mod tests {
             store.cpp_type_lookup_failures(&|| false).is_err(),
             "missing required source context must not become an empty list"
         );
+    }
+
+    #[test]
+    fn selected_lookup_failures_preserve_global_evidence_and_read_only_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("facts.db");
+        let file_id = FileId::generate("calls.cpp");
+        let primary = TextRange {
+            start_byte: 10,
+            end_byte: 14,
+            ..Default::default()
+        };
+        let declaration = (
+            file_id,
+            TextRange {
+                start_byte: 20,
+                end_byte: 24,
+                ..Default::default()
+            },
+        );
+        let id = |n| ReferenceId::from_bytes([n; 32]);
+        let store = Store::open_db(&path).unwrap();
+        store.init_schema().unwrap();
+        let facts = FileFacts {
+            file: FileInfo {
+                file_id,
+                path: "calls.cpp".into(),
+                language: Language::Cpp,
+                ..Default::default()
+            },
+            references: (1..=8)
+                .map(|n| types::ReferenceUse {
+                    id: id(n),
+                    file_id,
+                    source_symbol: None,
+                    scope_id: None,
+                    kind: types::ReferenceKind::Call,
+                    text: "invoke()".into(),
+                    name: "invoke".into(),
+                    receiver: None,
+                    arity: Some(0),
+                    range: primary,
+                    binding_id: None,
+                    resolved: None,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        store.insert_file_facts(&facts).unwrap();
+        let common = CppTypeLookupFailure {
+            kind: CppTypeLookupFailureKind::LookupRestricted,
+            name: "Base".into(),
+            scope: "api".into(),
+            file_id,
+            range: primary,
+            related_declarations: vec![declaration, declaration],
+        };
+        let updates: Vec<_> = (1..=7)
+            .map(|n| {
+                let mut failure = common.clone();
+                if n == 3 || n == 4 {
+                    failure.name = "Conflicting".into();
+                    if n == 4 {
+                        failure.related_declarations.pop();
+                    }
+                }
+                if n == 5 || n == 6 {
+                    failure.name = "Empty".into();
+                    failure.related_declarations.clear();
+                }
+                if n == 7 {
+                    failure.file_id = FileId::generate("absent.h");
+                }
+                (id(n), Some(failure))
+            })
+            .collect();
+        store
+            .batch_update_cpp_type_lookup_failures(&updates)
+            .unwrap();
+        drop(store);
+        let before = std::fs::read(&path).unwrap();
+        let store = Store::open_db_read_only(&path).unwrap();
+        let global = store.cpp_type_lookup_failures(&|| false).unwrap();
+        for requested in [
+            vec![],
+            vec![id(8), id(99)],
+            vec![id(1), id(1), id(3), id(5), id(7), id(8), id(99)],
+        ] {
+            let result = store
+                .cpp_type_lookup_failures_for_references(&requested, &|| false)
+                .unwrap();
+            let expected: HashMap<_, _> = global
+                .iter()
+                .filter(|(id, _)| requested.contains(id))
+                .map(|(id, f)| (*id, f.clone()))
+                .collect();
+            assert_eq!(result.failures, expected);
+            assert_eq!(result.work.failures_decoded, expected.len());
+            assert_eq!(
+                result.work.unique_references_requested,
+                requested.iter().collect::<HashSet<_>>().len()
+            );
+            assert_eq!(
+                result.work.global_contexts_examined,
+                if expected.is_empty() { 0 } else { 7 }
+            );
+            for (reference, failure) in &result.failures {
+                // Independent oracle: preserve the original projection key and inventory comparison.
+                let matching: Vec<_> = global
+                    .values()
+                    .filter(|other| {
+                        other.code() == failure.code()
+                            && other.name == failure.name
+                            && other.scope == failure.scope
+                            && other.file_id == failure.file_id
+                            && other.range == failure.range
+                    })
+                    .collect();
+                let evidence = result.sharing[reference];
+                assert_eq!(evidence.matching_failures, matching.len());
+                assert_eq!(
+                    evidence.same_declarations,
+                    matching
+                        .iter()
+                        .all(|f| f.related_declarations == failure.related_declarations)
+                );
+            }
+        }
+        let result = store
+            .cpp_type_lookup_failures_for_references(&[id(1), id(3), id(5), id(7)], &|| false)
+            .unwrap();
+        assert!(result.sharing[&id(1)].has_shared_inventory());
+        assert!(!result.sharing[&id(3)].has_shared_inventory());
+        assert!(
+            result.sharing[&id(5)].has_shared_inventory(),
+            "empty inventory is evidence, not a projected region"
+        );
+        assert!(
+            store
+                .get_file(&result.failures[&id(7)].file_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .cpp_type_lookup_failures_for_references(&[], &|| true)
+                .is_err()
+        );
+        // Cancel during selection and during the global scan; no partial success.
+        for stop in [2, 5] {
+            let checks = std::cell::Cell::new(0);
+            assert!(
+                store
+                    .cpp_type_lookup_failures_for_references(&[id(1)], &|| {
+                        checks.set(checks.get() + 1);
+                        checks.get() >= stop
+                    })
+                    .is_err()
+            );
+        }
+        assert!(
+            store
+                .batch_update_cpp_type_lookup_failures(&[(id(1), None)])
+                .is_err()
+        );
+        drop(store);
+        assert_eq!(std::fs::read(path).unwrap(), before);
     }
 
     #[test]

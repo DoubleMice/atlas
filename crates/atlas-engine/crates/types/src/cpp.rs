@@ -20,7 +20,7 @@ pub struct CppTypeLookupFailure {
     pub related_declarations: Vec<(crate::FileId, TextRange)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CppTypeLookupFailureKind {
     DefinitionUnavailable,
@@ -34,7 +34,62 @@ pub enum CppTypeLookupFailureKind {
     AnalysisBudgetExceeded,
 }
 
+/// Identity of a reached prerequisite, excluding its declaration inventory.
+/// Equal positions can have different inventories in different lookup environments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CppTypeLookupContext {
+    pub kind: CppTypeLookupFailureKind,
+    pub name: String,
+    pub scope: String,
+    pub file_id: crate::FileId,
+    pub range: TextRange,
+}
+
+/// Global grouping evidence, not a decision to emit a source region. Consumers
+/// must also establish usable primary and related declaration locations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct CppTypeLookupSharing {
+    pub matching_failures: usize,
+    pub same_declarations: bool,
+}
+
+impl Default for CppTypeLookupSharing {
+    fn default() -> Self {
+        Self {
+            matching_failures: 0,
+            same_declarations: true,
+        }
+    }
+}
+
+impl CppTypeLookupSharing {
+    /// Compare the original ordered inventories, including duplicates. A single
+    /// disagreement disqualifies the entire context from shared presentation.
+    pub fn observe(
+        &mut self,
+        expected: &[(crate::FileId, TextRange)],
+        observed: &[(crate::FileId, TextRange)],
+    ) {
+        self.matching_failures += 1;
+        self.same_declarations &= expected == observed;
+    }
+
+    pub fn has_shared_inventory(self) -> bool {
+        self.matching_failures > 1 && self.same_declarations
+    }
+}
+
 impl CppTypeLookupFailure {
+    pub fn context(&self) -> CppTypeLookupContext {
+        CppTypeLookupContext {
+            kind: self.kind,
+            name: self.name.clone(),
+            scope: self.scope.clone(),
+            file_id: self.file_id,
+            range: self.range,
+        }
+    }
+
     pub fn code(&self) -> &'static str {
         match self.kind {
             CppTypeLookupFailureKind::DefinitionUnavailable => "cpp_type_definition_unavailable",
