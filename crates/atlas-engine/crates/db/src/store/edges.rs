@@ -496,6 +496,64 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Read reference-to-edge identities once for immutable query-side reuse.
+    /// This scans edge identity columns, not complete edge records. No schema
+    /// change or reference-column index is required, and non-call edges remain.
+    pub fn reference_edge_ids(
+        &self,
+        canceled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<std::collections::BTreeMap<ReferenceId, Vec<EdgeId>>> {
+        anyhow::ensure!(!canceled(), "reference edge identity read canceled");
+        let conn = self.lock_read();
+        let mut statement = conn.prepare(
+            "SELECT ref_id, edge_id FROM symbol_edges WHERE ref_id IS NOT NULL ORDER BY edge_id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, ReferenceId>(0)?, row.get::<_, EdgeId>(1)?))
+        })?;
+        let mut result = std::collections::BTreeMap::<_, Vec<_>>::new();
+        for row in rows {
+            anyhow::ensure!(!canceled(), "reference edge identity read canceled");
+            let (reference, edge) = row?;
+            result.entry(reference).or_default().push(edge);
+        }
+        anyhow::ensure!(!canceled(), "reference edge identity read canceled");
+        Ok(result)
+    }
+
+    /// Read complete edge records by their primary keys, keeping every kind.
+    /// Duplicate and absent IDs are harmless; cancellation never returns a
+    /// partial success. The database remains read-only.
+    pub fn find_edges_by_ids(
+        &self,
+        edge_ids: &[EdgeId],
+        canceled: &dyn Fn() -> bool,
+    ) -> anyhow::Result<Vec<RawEdge>> {
+        anyhow::ensure!(!canceled(), "edge identity read canceled");
+        let ids: std::collections::BTreeSet<_> = edge_ids.iter().copied().collect();
+        let ids: Vec<_> = ids.into_iter().collect();
+        let conn = self.lock_read();
+        let mut edges = std::collections::BTreeMap::new();
+        for chunk in ids.chunks(256) {
+            anyhow::ensure!(!canceled(), "edge identity read canceled");
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let mut statement = conn.prepare(&format!(
+                "SELECT edge_id, source, target, kind, confidence, provenance,
+                    ref_id, location_0, location_1, location_2, location_3, location_4, location_5,
+                    metadata, resolved_by FROM symbol_edges WHERE edge_id IN ({placeholders})"
+            ))?;
+            let rows =
+                statement.query_map(rusqlite::params_from_iter(chunk.iter()), row_to_edge)?;
+            for row in rows {
+                anyhow::ensure!(!canceled(), "edge identity read canceled");
+                let edge = row?;
+                edges.insert(edge.id, edge);
+            }
+        }
+        anyhow::ensure!(!canceled(), "edge identity read canceled");
+        Ok(edges.into_values().collect())
+    }
+
     /// Load ALL edges (for GraphSnapshot construction).
     /// Uses the shared connection via the mutex; long-running reads may
     //  block writes.  In the future this should use a separate read connection.

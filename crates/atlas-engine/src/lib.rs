@@ -71,7 +71,8 @@ pub use filesync::{
 
 /// Database store and schema version.
 pub use db::{
-    CURRENT_SCHEMA_VERSION, CppTypeLookupReadWork, CppTypeLookupSelection, DiscoveredFile, Store,
+    CURRENT_SCHEMA_VERSION, CppCallRegions, CppTypeLookupReadWork, CppTypeLookupSelection,
+    DiscoveredFile, Store,
 };
 
 /// Graph layer: builder, query engine, snapshots, annotation materialization.

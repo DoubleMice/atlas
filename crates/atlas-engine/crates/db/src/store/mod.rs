@@ -40,7 +40,7 @@ mod cfg;
 mod closure_coverage;
 mod closure_generations;
 mod cpp_types;
-pub use cpp_types::{CppTypeLookupReadWork, CppTypeLookupSelection};
+pub use cpp_types::{CppCallRegions, CppTypeLookupReadWork, CppTypeLookupSelection};
 mod dataflow;
 pub(crate) mod domain_rules;
 mod edges;

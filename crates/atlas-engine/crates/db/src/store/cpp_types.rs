@@ -11,6 +11,16 @@ use types::{
 
 use super::Store;
 
+/// File-local recorded regions needed to project calls, without deserializing
+/// unrelated receiver, argument, macro or declaration facts.
+#[derive(Debug, Default)]
+pub struct CppCallRegions {
+    pub lambda_captures: Vec<types::cpp::CppLambdaCapture>,
+    pub allocation_sites: Vec<types::cpp::CppAllocationSite>,
+    pub lookup_limits: Vec<types::cpp::CppLookupLimit>,
+    pub unverified_callable_scopes: Vec<types::SymbolId>,
+}
+
 /// Exact selected failures and global grouping evidence for each returned reference.
 #[derive(Debug, Default)]
 pub struct CppTypeLookupSelection {
@@ -294,6 +304,28 @@ impl Store {
             .map(|value| value?.parse::<types::SymbolId>())
             .collect()
     }
+    pub fn cpp_call_regions_for_file(
+        &self,
+        file: &FileId,
+    ) -> anyhow::Result<Option<CppCallRegions>> {
+        let json: Option<String> = self.lock_read().query_row(
+            "SELECT json_extract(facts_json, '$.lambda_captures', '$.allocation_sites',
+                '$.lookup_limits', '$.unverified_callable_scopes') FROM cpp_type_facts WHERE file_id = ?1",
+            [file], |row|row.get(0),
+        ).optional()?;
+        json.map(|json| {
+            let (lambda_captures, allocation_sites, lookup_limits, unverified_callable_scopes) =
+                serde_json::from_str(&json)?;
+            Ok(CppCallRegions {
+                lambda_captures,
+                allocation_sites,
+                lookup_limits,
+                unverified_callable_scopes,
+            })
+        })
+        .transpose()
+    }
+
     pub fn cpp_types_for_file(&self, file_id: &FileId) -> anyhow::Result<Option<CppFileTypes>> {
         let json: Option<String> = self
             .lock_read()
@@ -733,6 +765,20 @@ mod tests {
             Some(cpp.clone())
         );
         assert_eq!(store.all_cpp_types().unwrap()[&file_id], cpp);
+        let regions = store.cpp_call_regions_for_file(&file_id).unwrap().unwrap();
+        assert_eq!(regions.lambda_captures, cpp.lambda_captures);
+        assert_eq!(regions.allocation_sites, cpp.allocation_sites);
+        assert_eq!(regions.lookup_limits, cpp.lookup_limits);
+        assert_eq!(
+            regions.unverified_callable_scopes,
+            cpp.unverified_callable_scopes
+        );
+        assert!(
+            store
+                .cpp_call_regions_for_file(&FileId::generate("absent.cpp"))
+                .unwrap()
+                .is_none()
+        );
         assert_eq!(
             store.cpp_local_lookup_limits().unwrap()[&file_id],
             cpp.lookup_limits
