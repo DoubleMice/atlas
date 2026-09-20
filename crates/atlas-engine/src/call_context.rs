@@ -20,6 +20,8 @@ mod function;
 mod navigation;
 mod operations;
 mod preprocessing;
+mod session;
+pub use session::CallContextSession;
 pub mod references;
 mod templates;
 pub mod value_flow;
@@ -117,6 +119,7 @@ struct ParsedSource {
     source: String,
     tree: Tree,
     cpp: Option<types::cpp::CppFileTypes>,
+    stamp: session::SourceStamp,
 }
 
 struct Investigation<'a> {
@@ -126,6 +129,8 @@ struct Investigation<'a> {
     parsed: BTreeMap<FileId, Result<Arc<ParsedSource>, String>>,
     result: CallContextResult,
     symbol_static: BTreeMap<SymbolId, bool>,
+    reusable: Option<&'a mut session::ReusableSources>,
+    admitted_bytes: usize,
 }
 
 /// Navigate indexed C++ callable names and containing bodies independently of
@@ -142,6 +147,7 @@ pub fn inspect_call_context(
     include_control_conditions: bool,
     canceled: &dyn Fn() -> bool,
 ) -> anyhow::Result<CallContextResult> {
+    let _diagnostic = tracing::debug_span!(target: "atlas_context_work", "context_selection", path, start_byte, end_byte).entered();
     let mut query = Investigation {
         store,
         root,
@@ -149,58 +155,76 @@ pub fn inspect_call_context(
         parsed: BTreeMap::new(),
         result: CallContextResult::default(),
         symbol_static: BTreeMap::new(),
+        reusable: None,
+        admitted_bytes: 0,
     };
-    query.check()?;
-    let Some(file) = store
-        .find_files_by_path_prefix(path)?
-        .into_iter()
-        .find(|f| f.path == path)
-    else {
-        return Ok(query.result);
-    };
-    let references = store.find_references_by_file(&file.file_id)?;
-    let calls: Vec<_> = references
-        .iter()
-        .filter(|r| {
-            r.kind == ReferenceKind::Call
-                && r.range.start_byte < end_byte
-                && start_byte < r.range.end_byte
-        })
-        .collect();
-    query.callable_navigation(&file, start_byte, end_byte)?;
-    if include_control_conditions {
-        query.control_conditions(file.file_id, start_byte, end_byte)?;
-    }
-    if file.language != Language::Cpp {
-        for call in calls {
-            query.gap(call, "syntax_context_unsupported", "Receiver and argument context are not implemented for this language; stored calls and name candidates remain available.", vec![])?;
-        }
-        return Ok(query.result);
-    }
-    query.preprocessing_context(file.file_id, start_byte, end_byte)?;
-    query.operation_regions(file.file_id, start_byte, end_byte)?;
-    query.symbol_static = store
-        .find_symbols_by_file(&file.file_id)?
-        .into_iter()
-        .map(|s| (s.id, s.static_))
-        .collect();
-    let bindings = store.find_bindings_by_file(&file.file_id)?;
-    let scopes: BTreeMap<_, _> = store
-        .find_scopes_by_file(&file.file_id)?
-        .into_iter()
-        .map(|s| (s.id, s))
-        .collect();
-    if calls.is_empty() {
-        query.values(&file, start_byte, end_byte, &references, &bindings, &scopes)?;
-    }
-    for call in calls {
-        query.check()?;
-        query.template_callee(call)?;
-        query.receiver(call, &references, &bindings, &scopes)?;
-        query.arguments(call, &bindings, &scopes)?;
-    }
-    query.check()?;
+    query.inspect(path, start_byte, end_byte, include_control_conditions)?;
     Ok(query.result)
+}
+
+impl Investigation<'_> {
+    fn inspect(
+        &mut self,
+        path: &str,
+        start_byte: u32,
+        end_byte: u32,
+        include_control_conditions: bool,
+    ) -> anyhow::Result<()> {
+        self.check()?;
+        let Some(file) = self
+            .store
+            .find_files_by_path_prefix(path)?
+            .into_iter()
+            .find(|f| f.path == path)
+        else {
+            return Ok(());
+        };
+        let references = self.store.find_references_by_file(&file.file_id)?;
+        let calls: Vec<_> = references
+            .iter()
+            .filter(|r| {
+                r.kind == ReferenceKind::Call
+                    && r.range.start_byte < end_byte
+                    && start_byte < r.range.end_byte
+            })
+            .collect();
+        self.callable_navigation(&file, start_byte, end_byte)?;
+        if include_control_conditions {
+            self.control_conditions(file.file_id, start_byte, end_byte)?;
+        }
+        if file.language != Language::Cpp {
+            for call in calls {
+                self.gap(call, "syntax_context_unsupported", "Receiver and argument context are not implemented for this language; stored calls and name candidates remain available.", vec![])?;
+            }
+            return Ok(());
+        }
+        self.preprocessing_context(file.file_id, start_byte, end_byte)?;
+        self.operation_regions(file.file_id, start_byte, end_byte)?;
+        self.symbol_static = self
+            .store
+            .find_symbols_by_file(&file.file_id)?
+            .into_iter()
+            .map(|s| (s.id, s.static_))
+            .collect();
+        let bindings = self.store.find_bindings_by_file(&file.file_id)?;
+        let scopes: BTreeMap<_, _> = self
+            .store
+            .find_scopes_by_file(&file.file_id)?
+            .into_iter()
+            .map(|s| (s.id, s))
+            .collect();
+        if calls.is_empty() {
+            self.values(&file, start_byte, end_byte, &references, &bindings, &scopes)?;
+        }
+        for call in calls {
+            self.check()?;
+            self.template_callee(call)?;
+            self.receiver(call, &references, &bindings, &scopes)?;
+            self.arguments(call, &bindings, &scopes)?;
+        }
+        self.check()?;
+        Ok(())
+    }
 }
 
 impl Investigation<'_> {
@@ -270,12 +294,15 @@ impl Investigation<'_> {
         if let Some(parsed) = self.parsed.get(&id) {
             return parsed.clone();
         }
-        let parsed = self.load_source(id).map(Arc::new);
+        let parsed = self.load_source(id);
+        if let (Some(reusable), Ok(source)) = (&mut self.reusable, &parsed) {
+            reusable.insert(id, source.clone());
+        }
         self.parsed.insert(id, parsed.clone());
         parsed
     }
 
-    fn load_source(&mut self, id: FileId) -> Result<ParsedSource, String> {
+    fn load_source(&mut self, id: FileId) -> Result<Arc<ParsedSource>, String> {
         self.check().map_err(|e| e.to_string())?;
         let file = self
             .store
@@ -290,11 +317,20 @@ impl Investigation<'_> {
         }
         let mut input = std::fs::File::open(path).map_err(|e| e.to_string())?;
         let metadata = input.metadata().map_err(|e| e.to_string())?;
-        let remaining = MAX_CONTEXT_TOTAL_BYTES.saturating_sub(self.result.bytes_read);
+        let remaining = MAX_CONTEXT_TOTAL_BYTES.saturating_sub(self.admitted_bytes);
         if !metadata.is_file() || metadata.len() > MAX_CONTEXT_FILE_BYTES.min(remaining) as u64 {
             return Err("source exceeds the 8 MiB file or 32 MiB investigation read limit; read a smaller source range separately".into());
         }
+        let stamp = session::SourceStamp::new(&metadata);
+        if let Some(reusable) = &mut self.reusable {
+            if let Some(parsed) = reusable.get(id, &stamp) {
+                self.admitted_bytes += parsed.source.len();
+                tracing::debug!(target: "atlas_context_work", event = "source_reuse", path = %file.path, bytes = parsed.source.len());
+                return Ok(parsed);
+            }
+        }
         self.result.files_read += 1;
+        tracing::debug!(target: "atlas_context_work", event = "source_open", path = %file.path);
         let mut bytes = Vec::new();
         let mut buffer = [0; 8192];
         loop {
@@ -304,8 +340,10 @@ impl Investigation<'_> {
                 break;
             }
             self.result.bytes_read += n;
+            self.admitted_bytes += n;
+            tracing::debug!(target: "atlas_context_work", event = "source_read", path = %file.path, bytes = n);
             if bytes.len() + n > MAX_CONTEXT_FILE_BYTES
-                || self.result.bytes_read > MAX_CONTEXT_TOTAL_BYTES
+                || self.admitted_bytes > MAX_CONTEXT_TOTAL_BYTES
             {
                 return Err("source grew beyond the investigation read limit".into());
             }
@@ -349,6 +387,7 @@ impl Investigation<'_> {
                 std::ops::ControlFlow::Continue(())
             }
         };
+        tracing::debug!(target: "atlas_context_work", event = "parse", path = %file.path, bytes = source.len());
         let tree = parser
             .parse_with_options(
                 &mut |offset, _| parser_source.as_bytes().get(offset..).unwrap_or(&[]),
@@ -361,7 +400,12 @@ impl Investigation<'_> {
             .refine_tree(&parser_source, tree, self.canceled)
             .ok_or("context refinement was interrupted")?;
         drop(parser_source);
-        Ok(ParsedSource { source, tree, cpp })
+        Ok(Arc::new(ParsedSource {
+            source,
+            tree,
+            cpp,
+            stamp,
+        }))
     }
 
     fn receiver(

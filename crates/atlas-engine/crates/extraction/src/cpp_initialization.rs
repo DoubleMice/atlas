@@ -382,6 +382,7 @@ pub(crate) fn refine(source: &str, original: Tree, canceled: &dyn Fn() -> bool) 
             std::ops::ControlFlow::Continue(())
         }
     };
+    tracing::debug!(target: "atlas_context_work", event = "refinement_parse", bytes = hinted.len());
     let mut tree = parser.parse_with_options(
         &mut |offset, _| hinted.get(offset..).unwrap_or(&[]),
         None,

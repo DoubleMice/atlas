@@ -108,6 +108,8 @@ pub fn trace_value(
             parsed: BTreeMap::new(),
             result: CallContextResult::default(),
             symbol_static: BTreeMap::new(),
+            reusable: None,
+            admitted_bytes: 0,
         },
         temporary,
         loaded: BTreeSet::new(),

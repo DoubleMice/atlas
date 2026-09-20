@@ -2,6 +2,7 @@ use super::*;
 use crate::{ExtractionMode, IndexPipeline, IndexPipelineOptions, NoopSink};
 
 mod navigation;
+mod reuse;
 
 fn fixture(files: &[(&str, &str)]) -> (tempfile::TempDir, Arc<Store>) {
     let root = tempfile::tempdir().unwrap();

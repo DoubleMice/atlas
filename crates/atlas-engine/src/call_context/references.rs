@@ -32,6 +32,8 @@ pub fn find_binding_references(
         parsed: BTreeMap::new(),
         result: CallContextResult::default(),
         symbol_static: BTreeMap::new(),
+        reusable: None,
+        admitted_bytes: 0,
     };
     query.check()?;
     let Some(file) = store
